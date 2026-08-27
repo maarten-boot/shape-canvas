@@ -229,14 +229,17 @@ class GroupRecord:
     name: str = ""
     description: str = ""
     show_name: bool = False  # a group keeps its name hidden by default
+    parent: str = ""  # uuid of the group this one sits inside, empty when it is top level
 
-    def to_json(self, members: list[str]) -> dict[str, Any]:
+    def to_json(self, members: list[str], subgroups: list[str]) -> dict[str, Any]:
         return {
             "uuid": self.uuid,
             "name": self.name,
             "description": self.description,
             "show_name": self.show_name,
-            "members": members,
+            "parent": self.parent or None,
+            "members": members,  # shapes directly in this group
+            "subgroups": subgroups,  # groups directly in this group
         }
 
 
@@ -566,6 +569,7 @@ class DoodleMyShapes:
         self.root.bind("<Control-z>", lambda _event: self.undo())
         self.root.bind("<Control-g>", lambda _event: self.toggle_grid(flip=True))
         self.root.bind("<Control-Key-0>", lambda _event: self.center_drawing())
+        self.root.bind("<Destroy>", self.on_destroy)
         self.root.bind("<Control-G>", lambda _event: self.group_selection())  # Ctrl+Shift+G
         self.root.bind("<Control-U>", lambda _event: self.ungroup_selection())
         self.root.bind("<Control-Up>", lambda _event: self.set_depth("up"))
@@ -766,8 +770,8 @@ class DoodleMyShapes:
             self.canvas.tag_raise(label, item)
 
     def group_box(self, group: str) -> Box | None:
-        """Bounding box of a group's members, in model units."""
-        boxes = [self.shapes[member].box for member in self.group_index().get(group, [])]
+        """Bounding box of everything beneath a group, nested groups included."""
+        boxes = [self.shapes[member].box for member in self.group_shapes(group)]
         if not boxes:
             return None
         return (
@@ -781,9 +785,8 @@ class DoodleMyShapes:
         """Draw the name of every group that is showing one, centred on the group."""
         self.canvas.delete(TAG_GROUP_LABEL)
         self.group_labels.clear()
-        members_by_group = self.group_index()
         for identifier, group in self.groups.items():
-            members = members_by_group.get(identifier, [])
+            members = self.group_shapes(identifier)
             if not group.name or not group.show_name or not members:
                 continue
             box = self.group_box(identifier)
@@ -864,15 +867,11 @@ class DoodleMyShapes:
         self._post(self.shape_popup, event)
 
     def can_group(self) -> bool:
-        """True when grouping would achieve something: two or more shapes not already one group."""
-        if len(self.selection) < 2:
-            return False
-        groups = {self.shapes[identifier].group for identifier in self.selection}
-        already_one_group = len(groups) == 1 and "" not in groups
-        return not already_one_group
+        """True when there are two or more top-level pieces to wrap up."""
+        return len(self.selection_units()) >= 2
 
     def can_ungroup(self) -> bool:
-        return any(self.shapes[identifier].group for identifier in self.selection)
+        return any(self.root_group(identifier) for identifier in self.selection)
 
     def populate_shape_popup(self) -> None:
         """Rebuild the shape menu so it only offers what the current selection can do."""
@@ -1070,17 +1069,8 @@ class DoodleMyShapes:
 
     # ----------------------------------------------------------------- groups
 
-    def group_members(self, identifier: str) -> list[str]:
-        """Every shape sharing this shape's group, or just the shape when it is on its own."""
-        record = self.shapes.get(identifier)
-        if record is None:
-            return []
-        if not record.group:
-            return [identifier]
-        return [other for other in self.by_depth() if self.shapes[other].group == record.group]
-
     def group_index(self) -> dict[str, list[str]]:
-        """Group uuid -> its member shapes, in depth order."""
+        """Group uuid -> the shapes directly inside it, in depth order."""
         groups: dict[str, list[str]] = {}
         for identifier in self.by_depth():
             group = self.shapes[identifier].group
@@ -1088,42 +1078,129 @@ class DoodleMyShapes:
                 groups.setdefault(group, []).append(identifier)
         return groups
 
+    def child_groups(self, group: str) -> list[str]:
+        """The groups directly inside this one."""
+        return [other for other, record in self.groups.items() if record.parent == group]
+
+    def top_group(self, group: str) -> str:
+        """Walk up the nesting to the outermost group. Tolerates a malformed cycle."""
+        seen: set[str] = set()
+        current = group
+        while current in self.groups and self.groups[current].parent and current not in seen:
+            seen.add(current)
+            current = self.groups[current].parent
+        return current if current in self.groups else ""
+
+    def root_group(self, identifier: str) -> str:
+        """The outermost group a shape belongs to, or empty when it is loose."""
+        record = self.shapes.get(identifier)
+        if record is None or not record.group:
+            return ""
+        return self.top_group(record.group)
+
+    def group_shapes(self, group: str) -> list[str]:
+        """Every shape anywhere beneath this group, in depth order."""
+        found: set[str] = set()
+        pending = [group]
+        seen: set[str] = set()
+        direct = self.group_index()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            found.update(direct.get(current, []))
+            pending.extend(self.child_groups(current))
+        return [identifier for identifier in self.by_depth() if identifier in found]
+
+    def group_members(self, identifier: str) -> list[str]:
+        """Everything that moves with this shape: its whole top-level group, or just itself."""
+        root = self.root_group(identifier)
+        if not root:
+            return [identifier] if identifier in self.shapes else []
+        return self.group_shapes(root)
+
+    def selection_units(self) -> list[tuple[str, str]]:
+        """The selection as top-level pieces: ("group", uuid) or ("shape", uuid)."""
+        units: dict[tuple[str, str], None] = {}
+        for identifier in self.selection:
+            root = self.root_group(identifier)
+            units[("group", root) if root else ("shape", identifier)] = None
+        return list(units)
+
     def group_selection(self) -> None:
-        if len(self.selection) < 2:
-            self.set_status("Shift-click a second shape before grouping.")
+        """Wrap the selection in a new group.
+
+        Groups already in the selection are kept whole and become subgroups of the new one,
+        rather than being dissolved into a flat list of shapes.
+        """
+        units = self.selection_units()
+        if len(units) < 2:
+            self.set_status("Shift-click a second shape or group before grouping.")
             return
 
         group = GroupRecord()
         self.groups[group.uuid] = group
-        for member in self.selection:
-            self.shapes[member].group = group.uuid
+        nested = 0
+        for kind, identifier in units:
+            if kind == "group":
+                self.groups[identifier].parent = group.uuid
+                nested += 1
+            else:
+                self.shapes[identifier].group = group.uuid
+
         self.prune_groups()
         self.redraw_selection()
-        self.show_in_pane(self.target_for(self.selected))  # the pane now edits the group
+        self.show_in_pane(self.target_for(self.selected))  # the pane now edits the new group
         self.autosave("grouping")
-        self.set_status(f"Grouped {len(self.selection)} shapes as {group.uuid[:8]}.")
+        note = f", keeping {nested} existing group(s) whole" if nested else ""
+        self.set_status(f"Grouped {len(units)} items as {group.uuid[:8]}{note}.")
 
     def ungroup_selection(self) -> None:
-        grouped = [member for member in self.selection if self.shapes[member].group]
-        if not grouped:
+        """Take apart the outermost group only. Anything nested inside it stays a group."""
+        roots: dict[str, None] = {}
+        for identifier in self.selection:
+            root = self.root_group(identifier)
+            if root:
+                roots[root] = None
+        if not roots:
             self.set_status("Nothing in the selection belongs to a group.")
             return
 
-        for member in grouped:
-            self.shapes[member].group = ""
+        promoted = 0
+        for root in roots:
+            for shape in self.group_index().get(root, []):
+                self.shapes[shape].group = ""
+            for child in self.child_groups(root):
+                self.groups[child].parent = ""  # a subgroup survives, now at the top level
+                promoted += 1
+            del self.groups[root]
+
         self.prune_groups()
-        self.redraw_selection()
-        self.show_in_pane(self.target_for(self.selected))
+        self.select_items(self.selection, self.selected)  # the pane may now edit a shape
         self.autosave("ungrouping")
-        self.set_status(f"Ungrouped {len(grouped)} shapes.")
+        note = f" {promoted} subgroup(s) kept." if promoted else ""
+        self.set_status(f"Ungrouped {len(roots)} group(s).{note}")
 
     def prune_groups(self) -> None:
-        """Forget groups that no longer have any members, so the document stays tidy."""
-        alive = {record.group for record in self.shapes.values() if record.group}
-        for identifier in [key for key in self.groups if key not in alive]:
-            del self.groups[identifier]
-            if self.pane_target == ("group", identifier):
-                self.pane_target = None
+        """Forget groups holding neither a shape nor a subgroup, repeatedly until none are left."""
+        while True:
+            direct = self.group_index()
+            empty = [
+                identifier
+                for identifier in self.groups
+                if not direct.get(identifier) and not self.child_groups(identifier)
+            ]
+            if not empty:
+                break
+            for identifier in empty:
+                del self.groups[identifier]
+                if self.pane_target == ("group", identifier):
+                    self.pane_target = None
+
+        for record in self.groups.values():  # a parent that no longer exists means top level
+            if record.parent and record.parent not in self.groups:
+                record.parent = ""
 
     # ------------------------------------------------------------------ depth
 
@@ -1219,9 +1296,9 @@ class DoodleMyShapes:
         """What the pane edits for a given primary shape: its group if it has one, else itself."""
         if identifier is None or identifier not in self.shapes:
             return None
-        group = self.shapes[identifier].group
-        if group and group in self.groups:
-            return "group", group
+        root = self.root_group(identifier)
+        if root:
+            return "group", root
         return "shape", identifier
 
     def target_record(self, target: tuple[str, str] | None) -> ShapeRecord | GroupRecord | None:
@@ -1244,8 +1321,12 @@ class DoodleMyShapes:
         if record is None:
             self.pane_subject.configure(text="No shape selected")
         elif isinstance(record, GroupRecord):
-            members = len(self.group_index().get(record.uuid, []))
-            self.pane_subject.configure(text=f"Group of {members} shapes · editing the group\n{record.uuid}")
+            members = len(self.group_shapes(record.uuid))
+            nested = len(self.child_groups(record.uuid))
+            summary = f"Group of {members} shapes"
+            if nested:
+                summary += f" in {nested} subgroup(s)"
+            self.pane_subject.configure(text=f"{summary} · editing the group\n{record.uuid}")
             self.pane_name.insert(0, record.name)
             self.pane_description.insert("1.0", record.description)
         else:
@@ -1340,6 +1421,8 @@ class DoodleMyShapes:
     def release_space(self) -> None:
         self.space_release_job = None
         self.space_held = False
+        if not self.canvas.winfo_exists():  # the window closed while the timer was pending
+            return
         if self.drag_mode != "pan":  # a pan already under way runs until the button comes up
             self.canvas.configure(cursor="")
 
@@ -1928,9 +2011,8 @@ class DoodleMyShapes:
                 "color_groups": self.color_groups.get(),
             },
             "groups": [
-                self.groups[group].to_json([self.shapes[member].uuid for member in members])
-                for group, members in self.group_index().items()
-                if group in self.groups
+                record.to_json(self.group_index().get(identifier, []), self.child_groups(identifier))
+                for identifier, record in self.groups.items()
             ],
             "shapes": [self.shapes[identifier].to_json() for identifier in self.by_depth()],
         }
@@ -2146,23 +2228,65 @@ class DoodleMyShapes:
                     name=str(entry.get("name") or ""),
                     description=str(entry.get("description") or ""),
                     show_name=bool(entry.get("show_name", False)),
+                    parent=str(entry.get("parent") or ""),
                 )
                 for member in members:
                     record = self.shapes.get(str(member))
                     if record is not None:
                         record.group = identifier
 
+            # A file may state the nesting the other way round, as each group's subgroups.
+            for entry in groups:
+                if not isinstance(entry, dict):
+                    continue
+                parent = str(entry.get("uuid") or "")
+                subgroups = entry.get("subgroups")
+                if not parent or not isinstance(subgroups, list):
+                    continue
+                for child in subgroups:
+                    nested = self.groups.get(str(child))
+                    if nested is not None and not nested.parent:
+                        nested.parent = parent
+
         # A shape may name a group the list forgot; keep the membership and give it a bare record.
         for record in self.shapes.values():
             if record.group and record.group not in self.groups:
                 self.groups[record.group] = GroupRecord(uuid=record.group)
+
+        self.break_group_cycles()
         self.prune_groups()
+
+    def break_group_cycles(self) -> None:
+        """A hand-edited file could nest a group inside itself. Cut any loop at the top."""
+        for identifier in self.groups:
+            seen: set[str] = {identifier}
+            current = self.groups[identifier].parent
+            while current and current in self.groups:
+                if current in seen:
+                    self.groups[identifier].parent = ""
+                    break
+                seen.add(current)
+                current = self.groups[current].parent
 
     def warn(self, title: str, message: str) -> None:
         messagebox.showwarning(title, message, parent=self.root)
         self.set_status(f"{title}. File ignored.")
 
+    def cancel_pending(self) -> None:
+        """Drop any timer that would otherwise fire into a window that no longer exists."""
+        if self.space_release_job is not None:
+            try:
+                self.root.after_cancel(self.space_release_job)
+            except tk.TclError:
+                pass
+            self.space_release_job = None
+
+    def on_destroy(self, event: tk.Event) -> None:
+        if event.widget is self.root:  # fires for every child too, so check it is the window
+            self.cancel_pending()
+
     def on_close(self) -> None:
+        self.cancel_pending()
         self.write_state(self.state_file)
         self.root.destroy()
 

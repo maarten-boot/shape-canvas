@@ -928,6 +928,118 @@ ok33 = ok33 and b.shapes[left].group and b.shapes[left].group == b.shapes[middle
 check(33, "grouping entries appear only when they apply", ok33, f"{lone} / {two} / {grouped} / {mixed}")
 root.destroy()
 
+# -------------------------------------------------------------------- 34, 35
+root = tk.Tk()
+n = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".nested")
+root.update()
+root.update_idletasks()
+
+a1 = n.add_shape("rectangle", 200, 200)
+a2 = n.add_shape("circle", 400, 200)
+b1 = n.add_shape("rectangle", 800, 200)
+b2 = n.add_shape("circle", 1000, 200)
+solo = n.add_shape("rectangle", 1400, 700)
+
+n.select(a1)
+n.select(a2, add=True)
+n.group_selection()
+inner_a = n.root_group(a1)
+n.select(b1)
+n.select(b2, add=True)
+n.group_selection()
+inner_b = n.root_group(b1)
+n.pane_name.insert(0, "Inner B")
+n.commit_pane()
+
+# 34: grouping two groups keeps them whole
+n.select(a1)              # selects all of inner A
+n.select(b1, add=True)    # adds all of inner B
+ok34 = sorted(n.selection) == sorted([a1, a2, b1, b2])
+ok34 = ok34 and len(n.selection_units()) == 2  # two pieces, not four
+n.group_selection()
+outer = n.root_group(a1)
+ok34 = ok34 and outer not in (inner_a, inner_b) and len(n.groups) == 3
+ok34 = ok34 and n.groups[inner_a].parent == outer and n.groups[inner_b].parent == outer
+ok34 = ok34 and n.groups[outer].parent == ""
+ok34 = ok34 and n.groups[inner_b].name == "Inner B"  # the subgroup kept its properties
+ok34 = ok34 and sorted(n.child_groups(outer)) == sorted([inner_a, inner_b])
+ok34 = ok34 and sorted(n.group_shapes(outer)) == sorted([a1, a2, b1, b2])
+ok34 = ok34 and n.group_index().get(outer, []) == []  # it holds groups, not shapes directly
+
+# touching any shape selects the whole outer group, and the pane edits the outer group
+n.select(None)
+n.select(b2)
+ok34 = ok34 and sorted(n.selection) == sorted([a1, a2, b1, b2]) and n.pane_target == ("group", outer)
+
+# moving one member moves everything beneath the outer group
+before = {k: n.shapes[k].box for k in (a1, a2, b1, b2, solo)}
+n.begin_drag("move", *n.shapes[b2].center)
+n.on_drag(press(*n.point_to_screen(n.shapes[b2].center[0] + 150, n.shapes[b2].center[1] + 75)))
+n.on_release(tk.Event())
+deltas = {k: tuple(round(x - y, 6) for x, y in zip(n.shapes[k].box, before[k])) for k in (a1, a2, b1, b2)}
+ok34 = ok34 and len(set(deltas.values())) == 1 and n.shapes[solo].box == before[solo]
+
+# the nesting round-trips
+saved = Path(HOME) / "nested.json"
+n.write_state(saved)
+entry = {g["uuid"]: g for g in json.loads(saved.read_text())["groups"]}
+ok34 = ok34 and entry[inner_a]["parent"] == outer and sorted(entry[outer]["subgroups"]) == sorted([inner_a, inner_b])
+ok34 = ok34 and entry[outer]["members"] == []
+before_state = json.dumps(n.to_state(), sort_keys=True)
+n.clear_canvas()
+n.load_state(saved, announce=False)
+ok34 = ok34 and json.dumps(n.to_state(), sort_keys=True) == before_state
+check(34, "grouping wraps existing groups instead of dissolving them", ok34)
+
+# 35: ungrouping peels one layer only
+a1 = next(k for k in n.shapes if n.shapes[k].uuid == a1)
+n.select(a1)
+outer = n.root_group(a1)
+n.ungroup_selection()
+ok35 = outer not in n.groups and len(n.groups) == 2
+ok35 = ok35 and n.groups[inner_a].parent == "" and n.groups[inner_b].parent == ""
+ok35 = ok35 and n.groups[inner_b].name == "Inner B"
+
+# the subgroups are now the top level: selecting a member picks up its subgroup only
+n.select(None)
+n.select(a1)
+ok35 = ok35 and sorted(n.selection) == sorted([a1, a2]) and n.pane_target == ("group", inner_a)
+
+# ungroup again dissolves the last layer
+n.ungroup_selection()
+ok35 = ok35 and inner_a not in n.groups and n.shapes[a1].group == "" and inner_b in n.groups
+n.select(a1)
+ok35 = ok35 and n.selection == [a1] and n.pane_target == ("shape", a1)
+
+# the popup reflects the nesting
+def entries_for(*picked):
+    n.select(picked[0])
+    for extra_pick in picked[1:]:
+        n.select(extra_pick, add=True)
+    n.populate_shape_popup()
+    found = []
+    for index in range(n.shape_popup.index("end") + 1):
+        try:
+            found.append(n.shape_popup.entrycget(index, "label"))
+        except tk.TclError:
+            pass
+    return found
+
+ok35 = ok35 and entries_for(a1) == ["Color", "Depth"]
+ok35 = ok35 and entries_for(b1) == ["Color", "Depth", "Ungroup"]  # a whole group, nothing to add
+ok35 = ok35 and entries_for(b1, a1) == ["Color", "Depth", "Group selection", "Ungroup"]
+
+# a group nested inside itself in a hand-edited file is repaired, not hung
+broken = Path(HOME) / "cycle.json"
+document = json.loads(saved.read_text())
+for group in document["groups"]:
+    group["parent"] = document["groups"][0]["uuid"] if group is not document["groups"][0] else group["uuid"]
+broken.write_text(json.dumps(document))
+ok35 = ok35 and n.load_state(broken, announce=False)
+ok35 = ok35 and all(n.top_group(g) in n.groups or not n.groups[g].parent for g in n.groups)
+check(35, "ungrouping peels the outermost layer and keeps subgroups", ok35)
+root.destroy()
+
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} checks passed")
 if FAIL:
     print("failed:", FAIL)

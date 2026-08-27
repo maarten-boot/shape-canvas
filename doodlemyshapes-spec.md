@@ -186,7 +186,7 @@ up one, Move down one, Send to bottom) always; then, only when they would do som
 
 | Entry | Shown when |
 |---|---|
-| `Group selection` | two or more shapes are selected and they are not already one single group |
+| `Group selection` | the selection holds two or more top-level pieces (groups count as one each) |
 | `Ungroup` | at least one selected shape belongs to a group |
 
 A lone ungrouped shape therefore offers `Color` and `Depth` and nothing else — no separator, no
@@ -226,9 +226,11 @@ a source of truth.
 | `name` | string | may be empty |
 | `description` | string | may be empty |
 | `show_name` | bool | whether the group name is drawn; default **false** |
+| `parent` | string | uuid of the enclosing group, empty at the top level |
 
-Members are not stored on the group at runtime; they are the shapes whose `group` matches. The
-document writes them out explicitly so the membership is readable and authoritative on load.
+Members are not stored on the group at runtime; the shapes directly inside it are those whose
+`group` matches, and the groups directly inside it are those whose `parent` matches. The document
+writes both out explicitly so the structure is readable and authoritative on load.
 
 **Invariants**
 
@@ -239,8 +241,10 @@ document writes them out explicitly so the membership is readable and authoritat
 - `width` and `height` are at least `min_extent` (§12) — including every member of a group after
   the group has been resized.
 - Every uuid in a group's `members` list refers to an existing shape.
-- Every group record has at least one member; empty groups are pruned.
-- Every non-empty `group` field on a shape names an existing group record.
+- Every group record holds at least one shape or subgroup; empty groups are pruned.
+- Every non-empty `group` on a shape, and every non-empty `parent` on a group, names an existing
+  group record.
+- The parent links form a forest: no group is its own ancestor.
 
 Interactions compute new field values on the model and then redraw. Serialisation reads the model.
 The model must be fully usable with no display attached: creating shapes, snapping, grouping, depth
@@ -268,7 +272,9 @@ ordering, undo and serialisation all work headlessly.
       "name": "Bracket assembly",
       "description": "Two parts, welded.",
       "show_name": false,
-      "members": ["shape-uuid", "shape-uuid"]
+      "parent": null,
+      "members": ["shape-uuid", "shape-uuid"],
+      "subgroups": ["group-uuid"]
     }
   ],
   "shapes": [
@@ -490,18 +496,40 @@ Holding **Shift** on a corner handle preserves the frame's aspect ratio.
 
 ## 13. Grouping
 
-- Grouping requires at least two selected shapes. It assigns a fresh group uuid to each.
-- Ungrouping clears the group from every selected shape that has one.
+**Groups nest.** A group holds shapes, other groups, or both, so the membership is a tree rather
+than a flat list. A shape's `group` names its immediate parent; a group's `parent` names the group
+it sits inside, empty at the top level.
+
+The **top-level group** of a shape is found by walking `parent` links to the outermost group. That
+is the unit the interface works in:
+
+- Selecting any shape selects every shape beneath its top-level group, however deeply nested.
+- Moving or resizing therefore acts on the whole outermost group.
+- The properties pane edits the top-level group.
+
+**Grouping keeps existing groups whole.** It works on the selection's top-level *pieces*, not its
+shapes: a piece is either a top-level group or a loose shape. Grouping needs two or more pieces, and
+makes each one a child of a new group. A group swept into a new group becomes a subgroup, keeping
+its own uuid, name, description and contents — it is never dissolved into loose shapes.
+
+**Ungrouping peels one layer.** It removes the outermost group of each selected piece and promotes
+its children: shapes directly inside become loose, and subgroups survive intact at the top level.
+Ungrouping twice is needed to take apart two levels.
+
 - Group membership drives selection (§11), which in turn drives move and resize (§12) — there is no
   separate group-transform code path.
-- Groups are saved and restored.
+- Groups are saved and restored, nesting included.
 
 **A group is a record, not just a label.** It has a uuid, a `name` and a `description` of its own,
 independent of its members' names. Membership lives on the shapes; the group record holds the
 properties.
 
-A group with no members left — after ungrouping, or after its last member is deleted — is removed
-from the model and from the document. Orphan group records never persist.
+A group holding neither a shape nor a subgroup is removed from the model and from the document.
+Pruning repeats until nothing more is empty, since removing an inner group can empty its parent. A
+`parent` naming a group that no longer exists is treated as top level.
+
+A hand-edited file could nest a group inside itself. Detect the loop when reading and cut it by
+clearing the offending `parent`, rather than looping forever when walking up.
 
 A group's name is *not* drawn on the canvas; only shape names are (§16).
 
@@ -739,3 +767,10 @@ An implementation is correct if all of these hold, verifiable without a human at
 33. The shape popup offers `Color` and `Depth` alone for a lone ungrouped shape, adds
     `Group selection` for two or more loose shapes, adds `Ungroup` for a group, and offers both for
     a group plus a loose shape.
+34. Grouping two groups produces one outer group with both as subgroups, each keeping its uuid,
+    name and contents; the outer group holds no shapes directly. Selecting any shape selects all
+    four, moving one moves all four by an identical delta, and the nesting round-trips through save
+    and load.
+35. Ungrouping the outer group removes only that group and leaves both subgroups intact at the top
+    level; a second ungroup dissolves one of them while the other survives. A file nesting a group
+    inside itself loads without hanging.
