@@ -296,6 +296,8 @@ class DoodleMyShapes:
         self.pan_origin: tuple[float, float] = (0.0, 0.0)
         self.band_origin: tuple[float, float] = (0.0, 0.0)  # in model units
         self.band_base: list[str] = []  # selection to add to, when the band is additive
+        self.drag_moved = False  # whether the current drag actually shifted anything
+        self.collapse_to: str | None = None  # shape to fall back to if a press turns out to be a click
         self.canvas_size: tuple[int, int] | None = None  # None until the first layout
         self.resize_job: str | None = None
         self.pane_visible = True
@@ -1627,13 +1629,27 @@ class DoodleMyShapes:
             self.begin_band(x, y, add=shift)  # a click that never moves just deselects
             return
 
-        self.select(identifier, add=shift)
+        if shift:
+            self.select(identifier, add=True)
+            if identifier not in self.selection:  # shift-clicked it out; nothing to drag
+                self.drag_mode = None
+                return
+        elif identifier in self.selection:
+            # Pressing inside an existing selection keeps it, so the whole set can be dragged
+            # as one. If the press turns out to be a click, the selection collapses on release.
+            if self.selected != identifier:
+                self.select_items(self.selection, identifier)
+            self.collapse_to = identifier
+        else:
+            self.select(identifier)
+
         self.begin_drag("move", x, y)
         self.drag_handle = None
 
     def begin_drag(self, mode: str, x: float, y: float) -> None:
         """Remember where everything started, so snapping measures from a fixed origin."""
         self.drag_mode = mode
+        self.drag_moved = False
         self.drag_start = (x, y)
         self.drag_boxes = {identifier: self.shapes[identifier].box for identifier in self.selection}
         box = self.selection_box()
@@ -1769,6 +1785,8 @@ class DoodleMyShapes:
         left = self.snap(self.drag_bbox[0] + (x - self.drag_start[0]))
         top = self.snap(self.drag_bbox[1] + (y - self.drag_start[1]))
         dx, dy = left - self.drag_bbox[0], top - self.drag_bbox[1]
+        if dx or dy:
+            self.drag_moved = True
         for identifier, (bx1, by1, bx2, by2) in self.drag_boxes.items():
             self.shapes[identifier].set_box((bx1 + dx, by1 + dy, bx2 + dx, by2 + dy))
 
@@ -1776,6 +1794,8 @@ class DoodleMyShapes:
         """Scale every selected shape into the new frame, keeping their relative places."""
         ox1, oy1, ox2, oy2 = self.drag_bbox
         nx1, ny1, nx2, ny2 = box
+        if box != self.drag_bbox:
+            self.drag_moved = True
         scale_x = (nx2 - nx1) / (ox2 - ox1) if ox2 > ox1 else 1.0
         scale_y = (ny2 - ny1) / (oy2 - oy1) if oy2 > oy1 else 1.0
         for identifier, (bx1, by1, bx2, by2) in self.drag_boxes.items():
@@ -1826,12 +1846,18 @@ class DoodleMyShapes:
             self.end_pan()
             return
         if self.drag_mode is not None and self.selection:
-            if self.selected is not None:
-                self.report_size(self.selected)
-            self.autosave("move" if self.drag_mode == "move" else "resize")  # written once the drag settles
+            if self.drag_moved:
+                if self.selected is not None:
+                    self.report_size(self.selected)
+                self.autosave("move" if self.drag_mode == "move" else "resize")  # once the drag settles
+            elif self.collapse_to is not None:
+                # A press inside a selection that never travelled is a plain click on that shape.
+                self.select(self.collapse_to)
+
         self.drag_mode = None
         self.drag_handle = None
         self.drag_boxes = {}
+        self.collapse_to = None
 
     @staticmethod
     def modifiers(event: tk.Event) -> int:

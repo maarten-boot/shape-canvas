@@ -461,7 +461,16 @@ directly above its own shape, and a group's name label directly above its topmos
 
 ## 12. Move and resize
 
-Both operate on the entire selection, so a group moves and resizes as one piece.
+Both operate on the entire selection, so a group — or any shift-built multiple selection — moves
+and resizes as one piece.
+
+**Pressing inside an existing selection keeps it.** Clicking a shape that is already selected does
+not collapse the selection to that shape; it makes it the primary member and begins a drag of the
+whole set. The collapse happens on *release* instead, and only if the press never travelled: a click
+inside a selection selects just that shape, a drag moves everything.
+
+Shift-clicking a selected shape removes it from the selection and starts no drag. Clicking an
+unselected shape replaces the selection as usual.
 
 **On press**, record each selected shape's box and the selection's bounding box.
 
@@ -504,7 +513,12 @@ be after any non-integral scale — keeps its origin where it was.
 
 Holding **Shift** on a corner handle preserves the frame's aspect ratio.
 
-**On release**, record one undo step and write the state file.
+**On release**, record one undo step and write the state file — one step for the whole selection,
+however many shapes moved.
+
+A drag that changed nothing records nothing: track whether the drag actually shifted or resized
+anything, and skip the save when it did not. This matters for both kinds of drag — a press that
+never travels, and a resize that snaps back to where it started.
 
 ---
 
@@ -825,3 +839,7 @@ An implementation is correct if all of these hold, verifiable without a human at
     them, and stops being covered when that shape is sent below. With nested groups each name rides
     at its own group's depth. Handles stay above everything and the grid below everything, and the
     ordering survives a reload.
+39. Pressing inside a shift-built selection keeps it and drags every member by an identical delta,
+    leaving unselected shapes untouched and recording one undo step. A press that never travels
+    collapses the selection to that shape and writes nothing. Shift-clicking a selected shape
+    removes it and starts no drag.

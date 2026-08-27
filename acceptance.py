@@ -1251,6 +1251,98 @@ ok38 = ok38 and place(d.group_labels[top_group]) > place(d.items[top_member])
 check(38, "a group's name rides at its group's depth and is covered by shapes above it", ok38)
 root.destroy()
 
+# ------------------------------------------------------------------------ 39
+root = tk.Tk()
+m = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".multimove")
+root.update()
+root.update_idletasks()
+
+first = m.add_shape("rectangle", 300, 200)
+second = m.add_shape("circle", 700, 400)
+third = m.add_shape("rectangle", 1100, 250)
+
+
+def centre(identifier, dx=0.0, dy=0.0):
+    cx, cy = m.shapes[identifier].center
+    return m.point_to_screen(cx + dx, cy + dy)
+
+
+def boxes():
+    return {k: m.shapes[k].box for k in (first, second, third)}
+
+
+# pressing inside a shift-built selection keeps it, and the whole set drags as one
+m.select(first)
+m.select(second, add=True)
+before = boxes()
+m.on_press(press(*centre(first)))
+ok39 = len(m.selection) == 2 and m.selected == first and m.drag_mode == "move"
+m.on_drag(press(*centre(first, 150, 80)))
+m.on_release(tk.Event())
+deltas = {k: tuple(round(n - o, 6) for n, o in zip(m.shapes[k].box, before[k])) for k in (first, second)}
+ok39 = ok39 and deltas[first] == deltas[second] and deltas[first] != (0.0, 0.0, 0.0, 0.0)
+ok39 = ok39 and m.shapes[third].box == before[third]  # the unselected one stays put
+ok39 = ok39 and len(m.selection) == 2  # and the selection survives the drag
+
+# the whole move is a single undo step
+history = len(m.history)
+before = boxes()
+restored = {k: (m.shapes[k].x, m.shapes[k].y, m.shapes[k].width, m.shapes[k].height) for k in (first, second)}
+m.on_press(press(*centre(second)))
+m.on_drag(press(*centre(second, -120, 40)))
+m.on_release(tk.Event())
+ok39 = ok39 and len(m.history) == history + 1
+m.undo()
+# undo restores through the state document: position and size each round to 2dp independently,
+# so compare the stored fields rather than the derived far corner
+fields = lambda: {
+    k: tuple(round(v, 2) for v in (m.shapes[k].x, m.shapes[k].y, m.shapes[k].width, m.shapes[k].height))
+    for k in (first, second)
+}
+ok39 = ok39 and fields() == {k: tuple(round(v, 2) for v in restored[k]) for k in (first, second)}
+
+# three at once, dragged from the middle one
+m.select(first)
+m.select(second, add=True)
+m.select(third, add=True)
+before = boxes()
+m.on_press(press(*centre(second)))
+m.on_drag(press(*centre(second, 80, -160)))
+m.on_release(tk.Event())
+deltas = {k: tuple(round(n - o, 6) for n, o in zip(m.shapes[k].box, before[k])) for k in before}
+ok39 = ok39 and len(set(deltas.values())) == 1 and deltas[first] != (0.0, 0.0, 0.0, 0.0)
+
+# a press that never travels is a click: the selection collapses to that shape
+m.select(first)
+m.select(second, add=True)
+m.on_press(press(*centre(second)))
+m.on_release(tk.Event())
+ok39 = ok39 and m.selection == [second] and m.pane_target == ("shape", second)
+
+# shift-clicking a selected shape removes it and starts no drag
+m.select(first)
+m.select(second, add=True)
+m.on_press(press(*centre(second), shift=True))
+ok39 = ok39 and m.selection == [first] and m.drag_mode is None
+
+# clicking an unselected shape still replaces the selection
+m.select(first)
+m.select(second, add=True)
+m.on_press(press(*centre(third)))
+ok39 = ok39 and m.selection == [third]
+m.on_release(tk.Event())
+
+# a collapsing click writes nothing
+doc = json.dumps(m.to_state(), sort_keys=True)
+history = len(m.history)
+m.select(first)
+m.select(second, add=True)
+m.on_press(press(*centre(first)))
+m.on_release(tk.Event())
+ok39 = ok39 and json.dumps(m.to_state(), sort_keys=True) == doc and len(m.history) == history
+check(39, "a multiple selection drags as one piece and collapses on a click", ok39)
+root.destroy()
+
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} checks passed")
 if FAIL:
     print("failed:", FAIL)
