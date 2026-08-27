@@ -54,6 +54,9 @@ GRID_COLOR = "#cfe0f5"
 HANDLE_FILL = "#ffffff"
 HANDLE_OUTLINE = "#1f6feb"
 MARQUEE_DASH = (3, 2)
+BAND_DASH = (4, 3)
+BAND_STIPPLE = "gray12"
+BAND_MIN_DRAG = 3.0  # a drag shorter than this in screen pixels is just a click
 INK_DARK = "#101010"
 INK_LIGHT = "#ffffff"
 
@@ -112,6 +115,7 @@ TAG_GRID = "grid"
 TAG_LABEL = "label"
 TAG_MARK = "marquee"
 TAG_GROUP_LABEL = "group-label"
+TAG_BAND = "rubber-band"
 
 HANDLE_CURSORS = {
     "nw": "top_left_corner",
@@ -285,6 +289,8 @@ class DoodleMyShapes:
         self.space_release_job: str | None = None
         self.pan_from: tuple[float, float] = (0.0, 0.0)  # pointer in screen units when the pan began
         self.pan_origin: tuple[float, float] = (0.0, 0.0)
+        self.band_origin: tuple[float, float] = (0.0, 0.0)  # in model units
+        self.band_base: list[str] = []  # selection to add to, when the band is additive
 
         # --- history and preferences -----------------------------------------
         self.suspend_autosave = False
@@ -517,9 +523,7 @@ class DoodleMyShapes:
         self.depth_menu.add_command(label="Send to bottom", command=lambda: self.set_depth("bottom"))
         self.shape_popup.add_cascade(label="Depth", menu=self.depth_menu)
 
-        self.shape_popup.add_separator()
-        self.shape_popup.add_command(label="Group selection", command=self.group_selection)
-        self.shape_popup.add_command(label="Ungroup", command=self.ungroup_selection)
+        self.shape_extras = 2  # Color and Depth are always there; the rest is rebuilt per click
 
         # Releasing the right button while no entry is highlighted takes the menu back down.
         for menu in (self.canvas_popup, self.shape_popup, self.color_menu, self.depth_menu):
@@ -812,6 +816,7 @@ class DoodleMyShapes:
         self.canvas.delete(TAG_GROUP_LABEL)
         self.canvas.delete(TAG_HANDLE)
         self.canvas.delete(TAG_MARK)
+        self.canvas.delete(TAG_BAND)
         self.items.clear()
         self.labels.clear()
         self.group_labels.clear()
@@ -855,7 +860,31 @@ class DoodleMyShapes:
             self.select(identifier)
         elif self.selected != identifier:
             self.select_items(self.selection, identifier)
+        self.populate_shape_popup()
         self._post(self.shape_popup, event)
+
+    def can_group(self) -> bool:
+        """True when grouping would achieve something: two or more shapes not already one group."""
+        if len(self.selection) < 2:
+            return False
+        groups = {self.shapes[identifier].group for identifier in self.selection}
+        already_one_group = len(groups) == 1 and "" not in groups
+        return not already_one_group
+
+    def can_ungroup(self) -> bool:
+        return any(self.shapes[identifier].group for identifier in self.selection)
+
+    def populate_shape_popup(self) -> None:
+        """Rebuild the shape menu so it only offers what the current selection can do."""
+        self.shape_popup.delete(self.shape_extras, tk.END)
+        group, ungroup = self.can_group(), self.can_ungroup()
+        if not (group or ungroup):
+            return
+        self.shape_popup.add_separator()
+        if group:
+            self.shape_popup.add_command(label="Group selection", command=self.group_selection)
+        if ungroup:
+            self.shape_popup.add_command(label="Ungroup", command=self.ungroup_selection)
 
     def _post(self, menu: tk.Menu, event: tk.Event) -> None:
         try:
@@ -1387,9 +1416,7 @@ class DoodleMyShapes:
 
         identifier = self.shape_at(x, y)
         if identifier is None:
-            self.drag_mode = None
-            if not shift:  # shift-clicking empty space keeps what is already selected
-                self.select(None)
+            self.begin_band(x, y, add=shift)  # a click that never moves just deselects
             return
 
         self.select(identifier, add=shift)
@@ -1427,7 +1454,77 @@ class DoodleMyShapes:
 
         return math.ceil(min_w / cell) * cell, math.ceil(min_h / cell) * cell
 
+    def begin_band(self, x: float, y: float, add: bool) -> None:
+        """Start a rubber band on empty canvas. Shift keeps what is already selected."""
+        self.drag_mode = "band"
+        self.drag_start = (x, y)
+        self.band_origin = (x, y)
+        self.band_base = list(self.selection) if add else []
+        self.canvas.delete(TAG_BAND)
+
+    def draw_band(self, x: float, y: float) -> None:
+        self.canvas.delete(TAG_BAND)
+        x1, y1 = self.point_to_screen(min(self.band_origin[0], x), min(self.band_origin[1], y))
+        x2, y2 = self.point_to_screen(max(self.band_origin[0], x), max(self.band_origin[1], y))
+        self.canvas.create_rectangle(
+            x1,
+            y1,
+            x2,
+            y2,
+            outline=HANDLE_OUTLINE,
+            dash=BAND_DASH,
+            fill=HANDLE_OUTLINE,
+            stipple=BAND_STIPPLE,
+            tags=(TAG_BAND,),
+        )
+        self.canvas.tag_raise(TAG_BAND)
+
+    def band_box(self, x: float, y: float) -> Box:
+        return (
+            min(self.band_origin[0], x),
+            min(self.band_origin[1], y),
+            max(self.band_origin[0], x),
+            max(self.band_origin[1], y),
+        )
+
+    def shapes_touching(self, box: Box) -> list[str]:
+        """Every shape the band encloses or merely touches, bottom to top.
+
+        Groups come along whole: catching one member catches the group, so a banded selection
+        behaves exactly like one built with shift-click.
+        """
+        caught: dict[str, None] = {}
+        for identifier in self.by_depth():
+            x1, y1, x2, y2 = self.shapes[identifier].box
+            if x2 < box[0] or x1 > box[2] or y2 < box[1] or y1 > box[3]:
+                continue
+            for member in self.group_members(identifier):
+                caught[member] = None
+        return list(caught)
+
+    def finish_band(self, x: float, y: float) -> None:
+        self.canvas.delete(TAG_BAND)
+        travel = max(
+            abs(self.length_to_screen(x - self.band_origin[0])),
+            abs(self.length_to_screen(y - self.band_origin[1])),
+        )
+        if travel < BAND_MIN_DRAG:  # never really a drag; treat it as a click on empty canvas
+            self.select_items(self.band_base, self.band_base[-1] if self.band_base else None)
+            return
+
+        caught = self.shapes_touching(self.band_box(x, y))
+        chosen = self.band_base + [identifier for identifier in caught if identifier not in self.band_base]
+        self.select_items(chosen, chosen[-1] if chosen else None)
+        if len(chosen) > 1:
+            self.set_status(f"{len(chosen)} shapes selected.")
+        elif not chosen:
+            self.set_status("Nothing in the band.")
+
     def on_drag(self, event: tk.Event) -> None:
+        if self.drag_mode == "band":
+            self.draw_band(*self.pointer(event))
+            return
+
         if self.drag_mode == "pan":
             scale = self.display_scale or 1.0
             dx = self.canvas.canvasx(event.x) - self.pan_from[0]
@@ -1512,7 +1609,11 @@ class DoodleMyShapes:
 
         return x1, y1, x2, y2
 
-    def on_release(self, _event: tk.Event) -> None:
+    def on_release(self, event: tk.Event) -> None:
+        if self.drag_mode == "band":
+            self.drag_mode = None
+            self.finish_band(*self.pointer(event))
+            return
         if self.drag_mode == "pan":  # the viewport is not part of the document
             self.end_pan()
             return

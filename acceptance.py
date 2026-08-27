@@ -806,6 +806,128 @@ ok31 = ok31 and not posted[1:]  # no menu appeared from the middle button
 check(31, "view gestures record nothing; right button posts the menu, middle button pans", ok31, str(entries))
 root.destroy()
 
+# ---------------------------------------------------------------- 32, 33
+root = tk.Tk()
+b = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".band")
+root.update()
+root.update_idletasks()
+
+# a row of shapes, plus a group off to the right
+left = b.add_shape("rectangle", 200, 200)
+middle = b.add_shape("circle", 400, 200)
+far = b.add_shape("rectangle", 1400, 800)
+pair_a = b.add_shape("rectangle", 800, 500)
+pair_b = b.add_shape("circle", 1000, 500)
+b.select(pair_a)
+b.select(pair_b, add=True)
+b.group_selection()
+b.select(None)
+
+
+def band(x1, y1, x2, y2, shift=False):
+    b.on_press(press(*b.point_to_screen(x1, y1), shift=shift))
+    b.on_drag(press(*b.point_to_screen((x1 + x2) / 2, (y1 + y2) / 2)))
+    b.on_drag(press(*b.point_to_screen(x2, y2)))
+    b.on_release(press(*b.point_to_screen(x2, y2)))
+
+
+# 32: the band selects what it encloses or touches.
+# A band always starts on empty canvas - pressing on a shape moves it instead.
+box_left = b.shapes[left].box
+box_middle = b.shapes[middle].box
+
+band(box_left[0] - 20, box_left[1] - 20, box_middle[2] + 20, box_middle[3] + 20)
+ok32 = sorted(b.selection) == sorted([left, middle]) and far not in b.selection
+
+# merely clipping an edge is enough: start clear of the shape and drag back onto it
+band(box_left[2] + 120, box_left[1] + 5, box_left[2] - 1, box_left[1] + 10)
+ok32 = ok32 and b.selection == [left]
+
+# nothing moved while banding
+ok32 = ok32 and b.shapes[left].box == box_left and b.shapes[middle].box == box_middle
+
+# a band that misses everything clears the selection
+band(box_left[0] - 500, box_left[1] - 500, box_left[0] - 400, box_left[1] - 400)
+ok32 = ok32 and b.selection == [] and b.selected is None
+
+# one shape banded behaves as a plain single selection: no marquees, pane on the shape
+band(box_left[0] - 10, box_left[1] - 10, box_left[2] + 10, box_left[3] + 10)
+ok32 = ok32 and b.selection == [left] and b.canvas.find_withtag("marquee") == ()
+ok32 = ok32 and b.pane_target == ("shape", left) and len(b.canvas.find_withtag("handle")) == 8
+
+# catching one member of a group catches the whole group.
+# Aim at the member itself: the corner of a group's bounding box is often empty space.
+member_box = b.shapes[pair_a].box
+band(member_box[0] - 5, member_box[1] - 5, member_box[0] + 5, member_box[1] + 5)
+ok32 = ok32 and sorted(b.selection) == sorted([pair_a, pair_b])
+ok32 = ok32 and b.pane_target == ("group", next(iter(b.groups)))
+
+# shift extends an existing selection
+band(box_left[0] - 10, box_left[1] - 10, box_left[2] + 10, box_left[3] + 10)
+band(box_middle[0] - 10, box_middle[1] - 10, box_middle[2] + 10, box_middle[3] + 10, shift=True)
+ok32 = ok32 and sorted(b.selection) == sorted([left, middle])
+
+# a click that does not travel is still a plain deselect, and leaves no band behind
+b.on_press(press(*b.point_to_screen(box_left[0] - 400, box_left[1] - 400)))
+b.on_release(press(*b.point_to_screen(box_left[0] - 400, box_left[1] - 400)))
+ok32 = ok32 and b.selection == [] and b.canvas.find_withtag("rubber-band") == ()
+
+# the band is visible while dragging, stippled, and gone afterwards
+b.on_press(press(*b.point_to_screen(box_left[0] - 30, box_left[1] - 30)))
+b.on_drag(press(*b.point_to_screen(box_middle[2] + 30, box_middle[3] + 30)))
+drawn = b.canvas.find_withtag("rubber-band")
+ok32 = ok32 and len(drawn) == 1 and b.canvas.itemcget(drawn[0], "stipple") == "gray12"
+ok32 = ok32 and b.canvas.itemcget(drawn[0], "dash") != ""
+b.on_release(press(*b.point_to_screen(box_middle[2] + 30, box_middle[3] + 30)))
+ok32 = ok32 and b.canvas.find_withtag("rubber-band") == ()
+
+# selecting changes nothing on disk
+doc = json.dumps(b.to_state(), sort_keys=True)
+history = len(b.history)
+band(box_left[0] - 40, box_left[1] - 40, box_middle[2] + 40, box_middle[3] + 40)
+ok32 = ok32 and json.dumps(b.to_state(), sort_keys=True) == doc and len(b.history) == history
+check(32, "rubber band selects what it touches, groups included, and records nothing", ok32)
+
+
+# 33: the popup only offers grouping when it applies
+def popup_entries():
+    b.populate_shape_popup()
+    found = []
+    for index in range(b.shape_popup.index("end") + 1):
+        try:
+            found.append(b.shape_popup.entrycget(index, "label"))
+        except tk.TclError:
+            pass
+    return found
+
+
+b.select(far)  # a lone, ungrouped shape
+lone = popup_entries()
+ok33 = lone == ["Color", "Depth"]
+
+b.select(left)
+b.select(middle, add=True)  # two loose shapes
+two = popup_entries()
+ok33 = ok33 and two == ["Color", "Depth", "Group selection"]
+
+b.select(pair_a)  # a group
+grouped = popup_entries()
+ok33 = ok33 and grouped == ["Color", "Depth", "Ungroup"]
+
+b.select(pair_a)
+b.select(far, add=True)  # a group plus a loose shape: both make sense
+mixed = popup_entries()
+ok33 = ok33 and mixed == ["Color", "Depth", "Group selection", "Ungroup"]
+
+# and the entries still work after being rebuilt
+b.select(left)
+b.select(middle, add=True)
+b.populate_shape_popup()
+b.shape_popup.invoke(b.shape_popup.index("Group selection"))
+ok33 = ok33 and b.shapes[left].group and b.shapes[left].group == b.shapes[middle].group
+check(33, "grouping entries appear only when they apply", ok33, f"{lone} / {two} / {grouped} / {mixed}")
+root.destroy()
+
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} checks passed")
 if FAIL:
     print("failed:", FAIL)

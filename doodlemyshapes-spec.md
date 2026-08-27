@@ -181,8 +181,16 @@ shape one layer, `Ctrl+Shift+Up` / `Ctrl+Shift+Down` send it to top / bottom.
 
 Popups are on the **right button only**. The middle button pans (§10a).
 
-**Shape popup** (right click on a shape): `Color >` (the palette), `Depth >` (Bring to top, Move up
-one, Move down one, Send to bottom), separator, `Group selection`, `Ungroup`.
+**Shape popup** (right click on a shape): `Color >` (the palette) and `Depth >` (Bring to top, Move
+up one, Move down one, Send to bottom) always; then, only when they would do something:
+
+| Entry | Shown when |
+|---|---|
+| `Group selection` | two or more shapes are selected and they are not already one single group |
+| `Ungroup` | at least one selected shape belongs to a group |
+
+A lone ungrouped shape therefore offers `Color` and `Depth` and nothing else — no separator, no
+inapplicable entries. The menu is rebuilt from the current selection each time it is posted.
 
 There is no Properties entry: names and descriptions are edited in the pane (§18).
 
@@ -399,7 +407,24 @@ Zoom is not implemented yet; the transform above is written so it can be added a
 
 - Clicking a shape selects it; clicking empty canvas clears the selection.
 - **Shift + click** adds a shape to the selection; shift-clicking a selected shape removes it.
-- Shift-clicking empty canvas leaves the selection alone.
+
+### Rubber band
+
+**Dragging from empty canvas** draws a selection band and selects everything it encloses **or
+merely touches**, tested against bounding boxes. A band always starts on empty canvas; pressing on
+a shape moves that shape instead.
+
+- The band is drawn as a stippled, dashed rectangle while the button is held, and disappears on
+  release.
+- Catching any member of a group catches the whole group, so a banded selection is
+  indistinguishable from one built with shift-click.
+- Plain drag replaces the selection; **shift + drag** adds to it.
+- A band that catches exactly one shape behaves as an ordinary single selection: no member
+  marquees, and the pane edits that shape.
+- A band that catches nothing clears the selection.
+- A press and release that travels less than a few pixels is a click, not a band, and simply
+  deselects.
+- Banding selects; it changes no shape, writes nothing and records no undo step.
 - Selecting any member of a group selects the entire group.
 - The selection has a **primary** member — the most recently clicked — which is what the properties
   pane and the Properties window edit.
@@ -707,3 +732,10 @@ An implementation is correct if all of these hold, verifiable without a human at
     by either gesture, and centring, leave the document, the state file, the Json tab and the undo
     history byte-for-byte unchanged. The right button posts the menu; the middle button pans and
     posts nothing.
+32. A band selects what it encloses and what it merely clips, pulls in whole groups, extends the
+    selection with shift, clears it when it catches nothing, moves no shape, and leaves the
+    document and history untouched. A single caught shape shows no marquees. A press that does not
+    travel is a click, not a band.
+33. The shape popup offers `Color` and `Depth` alone for a lone ungrouped shape, adds
+    `Group selection` for two or more loose shapes, adds `Ungroup` for a group, and offers both for
+    a group plus a loose shape.
