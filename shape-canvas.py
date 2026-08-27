@@ -32,6 +32,7 @@ APP_VERSION = "v1"
 STATE_DIR = Path.home() / f".{APP_NAME}"
 STATE_FILE = STATE_DIR / "state.json"
 STATE_SUFFIX = ".json"
+HISTORY_LIMIT = 50  # how many undo steps are kept
 
 CANVAS_BG = "#f4f4f4"  # very light gray
 GRID_COLOR = "#cfe0f5"  # very light blue
@@ -192,6 +193,9 @@ class ShapeCanvasApp:
         self.menu_point: tuple[float, float] = (0.0, 0.0)
         self.shapes: dict[int, ShapeRecord] = {}  # canvas item id -> record
         self.suspend_autosave = False  # set while loading, so a load is one write not many
+        self.suspend_history = False  # set while undoing, so an undo is not itself recorded
+        self.history: list[tuple[str, dict[str, Any]]] = []  # (what changed, state before it)
+        self.baseline: dict[str, Any] | None = None  # the state as of the last recorded change
         self.show_grid = tk.BooleanVar(master=root, value=True)
         self.grid_color = tk.StringVar(master=root, value=GRID_COLOR)
         self.grid_line = tk.StringVar(master=root, value=GRID_LINE_DEFAULT)
@@ -206,6 +210,9 @@ class ShapeCanvasApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.set_status("Right-click the canvas to add a shape.")
         self.startup_load(clean=clean, startup_file=startup_file)
+        self.history.clear()  # whatever we started with is the starting point, not a change
+        self.baseline = self.to_state()
+        self._refresh_undo_button()
         self.refresh_json_view()
 
     # ------------------------------------------------------------------ setup
@@ -221,6 +228,10 @@ class ShapeCanvasApp:
         file_menu.add_separator()
         file_menu.add_command(label="Quit", accelerator="Ctrl+Q", command=self.on_close)
         menu_bar.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menu_bar, tearoff=False)
+        edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
+        menu_bar.add_cascade(label="Edit", menu=edit_menu)
 
         shape_menu = tk.Menu(menu_bar, tearoff=False)
         shape_menu.add_command(label="Add rectangle", command=lambda: self.add_shape_at_center("rectangle"))
@@ -323,8 +334,12 @@ class ShapeCanvasApp:
         self.pane_description.grid(row=0, column=0, sticky=tk.NSEW)
         scroll.grid(row=0, column=1, sticky=tk.NS)
 
-        self.pane_apply = ttk.Button(pane, text="Apply", command=self.commit_pane)
-        self.pane_apply.grid(row=6, column=0, sticky=tk.E)
+        buttons = ttk.Frame(pane)
+        buttons.grid(row=6, column=0, sticky=tk.EW)
+        self.undo_button = ttk.Button(buttons, text="Undo", command=self.undo, state=tk.DISABLED)
+        self.undo_button.pack(side=tk.LEFT)
+        self.pane_apply = ttk.Button(buttons, text="Apply", command=self.commit_pane)
+        self.pane_apply.pack(side=tk.RIGHT)
 
         # Typed text is kept when focus leaves the field, so edits are not lost by clicking away.
         self.pane_name.bind("<Return>", lambda _event: self.commit_pane())
@@ -422,6 +437,7 @@ class ShapeCanvasApp:
         self.root.bind("<BackSpace>", lambda _event: self.delete_selected())
         self.root.bind("<Escape>", lambda _event: self.select(None))
         self.root.bind("<Control-n>", lambda _event: self.clear_canvas())
+        self.root.bind("<Control-z>", lambda _event: self.undo())
         self.root.bind("<Control-g>", lambda _event: self.toggle_grid(flip=True))
         self.root.bind("<Control-Up>", lambda _event: self.set_depth("up"))
         self.root.bind("<Control-Down>", lambda _event: self.set_depth("down"))
@@ -473,7 +489,7 @@ class ShapeCanvasApp:
         """Redraw at the new pitch. Shapes already placed keep their positions."""
         self.grid_cm.set(self.grid_pitch())  # write the clamped value back
         self.draw_grid()
-        self.autosave()
+        self.autosave("grid size")
         self.set_status(f"Grid size {self.grid_pitch():g} cm. Shapes already placed were not moved.")
 
     def snap(self, value: float) -> float:
@@ -519,7 +535,7 @@ class ShapeCanvasApp:
         if not self.show_grid.get():
             self.show_grid.set(True)  # changing the look implies wanting to see it
         self.draw_grid()
-        self.autosave()
+        self.autosave("grid style")
         self.set_status(f"Grid: {self.grid_line.get().lower()} lines in {self.grid_color.get()}.")
 
     def toggle_grid(self, flip: bool = False) -> None:
@@ -527,7 +543,7 @@ class ShapeCanvasApp:
         if flip:
             self.show_grid.set(not self.show_grid.get())
         self.draw_grid()
-        self.autosave()
+        self.autosave("grid visibility")
         self.set_status("Grid shown." if self.show_grid.get() else "Grid hidden. Shapes still align to it.")
 
     # ----------------------------------------------------------- adding shapes
@@ -577,7 +593,7 @@ class ShapeCanvasApp:
             return
         self.canvas.itemconfigure(item, fill=color)
         record.fill = color
-        self.autosave()
+        self.autosave(f"recolor of {record.kind}")
         self.set_status(f"{record.kind.capitalize()} filled with {color}.")
 
     def choose_custom_fill(self) -> None:
@@ -624,7 +640,7 @@ class ShapeCanvasApp:
             return  # nothing typed, so nothing to save
 
         record.name, record.description = name, description
-        self.autosave()
+        self.autosave(f"edit of {record.kind} properties")
         self.set_status(f"Saved properties for {name or record.uuid[:8]}.")
 
     def open_properties(self) -> None:
@@ -644,7 +660,7 @@ class ShapeCanvasApp:
 
         record.name, record.description = dialog.result
         self.show_in_pane(self.selected)
-        self.autosave()
+        self.autosave(f"edit of {record.kind} properties")
         label = record.name or record.uuid[:8]
         self.set_status(f"Saved properties for {label}.")
 
@@ -669,7 +685,7 @@ class ShapeCanvasApp:
         self._renumber(self._by_depth())
         self.restack()
         self.select(item)
-        self.autosave()
+        self.autosave(f"adding the {kind}")
         self.set_status(f"Added {kind}. Drag it to move, drag a handle to resize.")
         return item
 
@@ -786,7 +802,7 @@ class ShapeCanvasApp:
         order.insert(target, order.pop(index))
         self._renumber(order)
         self.restack()
-        self.autosave()
+        self.autosave(f"depth change of {self._kind(item)}")
         depth = self.shapes[item].depth
         self.set_status(f"{self._kind(item).capitalize()} moved to depth {depth} of {len(order) - 1}.")
 
@@ -837,7 +853,7 @@ class ShapeCanvasApp:
     def on_release(self, _event: tk.Event) -> None:
         if self.drag_mode is not None and self.selected is not None:
             self._report_size(self.selected)
-            self.autosave()  # geometry is only written once the drag settles
+            self.autosave("move" if self.drag_mode == "move" else "resize")  # written once the drag settles
         self.drag_mode = None
         self.drag_handle = None
 
@@ -893,7 +909,7 @@ class ShapeCanvasApp:
         self.selected = None
         self.show_in_pane(None)
         self._renumber(self._by_depth())  # close the gap the deleted layer left
-        self.autosave()
+        self.autosave(f"deletion of the {record.kind if record else 'shape'}")
         self.set_status(f"Deleted {record.kind if record else 'shape'}.")
 
     def clear_canvas(self) -> None:
@@ -903,7 +919,7 @@ class ShapeCanvasApp:
         self.pane_item = None
         self.show_in_pane(None)
         self.draw_grid()  # "all" took the grid with it
-        self.autosave()
+        self.autosave("clearing the canvas")
         self.set_status("Canvas cleared. Right-click to add a shape.")
 
     def show_help(self) -> None:
@@ -973,12 +989,42 @@ class ShapeCanvasApp:
             return False
         return True
 
-    def autosave(self) -> None:
+    def autosave(self, label: str = "change") -> None:
         """Called after every change that alters the state."""
         if self.suspend_autosave:
             return
+        if not self.suspend_history:
+            self._record(label)
         self.refresh_json_view()
+        self._refresh_undo_button()
         self.write_state(STATE_FILE)
+
+    def _record(self, label: str) -> None:
+        """Push the state as it was before this change onto the undo stack."""
+        if self.baseline is not None:
+            self.history.append((label, self.baseline))
+            del self.history[:-HISTORY_LIMIT]  # keep only the most recent steps
+        self.baseline = self.to_state()
+
+    def undo(self) -> None:
+        """Step back to the state before the most recent change."""
+        if not self.history:
+            self.set_status("Nothing to undo.")
+            return
+
+        label, snapshot = self.history.pop()
+        self.suspend_history = True
+        try:
+            self.apply_state(snapshot)  # writes to disk, but records no new history
+        finally:
+            self.suspend_history = False
+
+        self.baseline = self.to_state()
+        self._refresh_undo_button()
+        self.set_status(f"Undid {label}. {len(self.history)} step(s) left.")
+
+    def _refresh_undo_button(self) -> None:
+        self.undo_button.configure(state=tk.NORMAL if self.history else tk.DISABLED)
 
     def save_state_dialog(self) -> None:
         chosen = filedialog.asksaveasfilename(
@@ -1122,7 +1168,7 @@ class ShapeCanvasApp:
             self.restack()
         finally:
             self.suspend_autosave = False
-        self.autosave()
+        self.autosave("loading a state file")
 
     @staticmethod
     def _box_from(entry: object) -> tuple[float, float, float, float] | None:

@@ -73,3 +73,6 @@ Add the depth level to the saved state.
 When a shape is selected,
 show the following properties in a window on the right side of the canvas and make them editable:
 `Name`, `Description`.
+If no shape is selected the Properties pane should not be editable.
+
+Allow for changes to be recorded in a history and Undone with a Undo button.
