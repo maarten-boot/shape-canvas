@@ -36,7 +36,16 @@ STATE_SUFFIX = ".json"
 HISTORY_LIMIT = 50  # how many undo steps are kept
 
 EXPORT_MARGIN_CM = 1.0  # blank border around the shapes in an exported picture
+# Dialog label -> the extension that label writes, and the patterns it matches.
+EXPORT_FILETYPES: tuple[tuple[str, str, str], ...] = (
+    ("PNG image", ".png", "*.png"),
+    ("JPEG image", ".jpg", "*.jpg *.jpeg"),
+    ("SVG drawing", ".svg", "*.svg"),
+)
 EXPORT_FORMATS = (".png", ".jpg", ".jpeg", ".svg")
+# Picture formats we deliberately do not write. Typing one of these is a mistake worth reporting,
+# rather than something to silently rename.
+EXPORT_UNSUPPORTED = (".bmp", ".gif", ".tif", ".tiff", ".webp", ".pdf", ".eps", ".ps", ".ico", ".heic")
 EXPORT_FONT_SIZE = 12
 EXPORT_FONTS = (  # first one that exists wins; Pillow's built-in font is the fallback
     "DejaVuSans.ttf",
@@ -1244,21 +1253,50 @@ class ShapeCanvasApp:
         )
 
     def export_dialog(self) -> None:
-        """Ask where to write the picture, then write it in the format the name implies."""
+        """Ask where to write the picture, then write it in the format the user picked.
+
+        The name is offered without an extension, and the one belonging to the chosen file
+        type is appended afterwards, so the two can never disagree.
+        """
         if not self.shapes:
             self.set_status("Draw something before exporting.")
             return
 
+        picked = tk.StringVar(master=self.root, value=EXPORT_FILETYPES[0][0])
         chosen = filedialog.asksaveasfilename(
             parent=self.root,
             title="Export as picture",
             initialdir=str(Path.home()),
-            initialfile=f"{APP_NAME}.png",
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg"), ("SVG drawing", "*.svg")],
+            initialfile=APP_NAME,  # no extension: the file type below supplies it
+            filetypes=[(label, patterns) for label, _suffix, patterns in EXPORT_FILETYPES],
+            typevariable=picked,
         )
-        if chosen:
-            self.export_to(Path(chosen))
+        if not chosen:
+            return
+
+        target = self._export_path(Path(chosen), picked.get())
+        if target is not None:
+            self.export_to(target)
+
+    def _export_path(self, chosen: Path, type_label: str) -> Path | None:
+        """Work out the file to write from the typed name and the selected file type."""
+        suffix = chosen.suffix.lower()
+        if suffix in EXPORT_FORMATS:
+            return chosen  # an explicit extension always wins over the dropdown
+
+        if suffix in EXPORT_UNSUPPORTED:
+            self._warn(
+                "Unsupported picture format",
+                f"{chosen}\n\nExport can write {', '.join(sorted(EXPORT_FORMATS))}. "
+                "Remove the extension and pick a file type instead.",
+            )
+            return None
+
+        for label, extension, _patterns in EXPORT_FILETYPES:
+            if label == type_label:
+                return chosen.with_name(chosen.name + extension)
+
+        return chosen.with_name(chosen.name + EXPORT_FILETYPES[0][1])  # dialog gave us no type
 
     def export_to(self, path: Path) -> bool:
         suffix = path.suffix.lower()
