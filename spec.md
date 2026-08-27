@@ -92,3 +92,6 @@ All deletes must be confirmed by default but add a option to delete without conf
 ## Export
 Add to the main menu under File a entry to export the data as a picture in 'jpg', 'png' or 'svg' format.
 Use the bounding box of all shapes with a margin of 1 cm around.
+When changing the file type to save also change the extension of the file displays to save or if that is easier do not show the extension but add it when saving after the format has been selected.
+
+-
