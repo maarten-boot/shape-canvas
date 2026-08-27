@@ -1040,6 +1040,217 @@ ok35 = ok35 and all(n.top_group(g) in n.groups or not n.groups[g].parent for g i
 check(35, "ungrouping peels the outermost layer and keeps subgroups", ok35)
 root.destroy()
 
+# ------------------------------------------------------------------------ 36
+root = tk.Tk()
+root.geometry("1000x640")
+r = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".resize")
+root.update()
+root.update_idletasks()
+r.add_shape("rectangle", 300, 200)
+r.add_shape("circle", 900, 600)
+
+
+def settle(ms=600):
+    end = time.time() + ms / 1000
+    while time.time() < end:
+        root.update()
+        time.sleep(0.01)
+
+
+def centred(app):
+    boxes = [record.box for record in app.shapes.values()]
+    if not boxes:
+        return (app.pan_x, app.pan_y) == (0.0, 0.0)
+    mid = (
+        (min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2,
+        (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2,
+    )
+    sx, sy = app.point_to_screen(*mid)
+    return abs(sx - app.canvas.winfo_width() / 2) < 1.5 and abs(sy - app.canvas.winfo_height() / 2) < 1.5
+
+
+# a pan is left alone while no resize happens
+r.pan_to(4000.0, -3000.0)
+settle(500)
+ok36 = not centred(r) and round(r.pan_x) == 4000
+
+# a burst of resize events recentres once, after the burst
+for width in (960, 900, 840, 800):
+    root.geometry(f"{width}x600")
+    root.update()
+    time.sleep(0.05)
+ok36 = ok36 and not centred(r)  # still settling: the burst has not finished
+settle(700)
+ok36 = ok36 and centred(r)
+
+# recentring writes nothing and records nothing
+doc = json.dumps(r.to_state(), sort_keys=True)
+history = len(r.history)
+state_file = Path(HOME) / ".resize/state.json"
+written = state_file.read_bytes()
+root.geometry("1080x700")
+settle(700)
+ok36 = ok36 and centred(r)
+ok36 = ok36 and json.dumps(r.to_state(), sort_keys=True) == doc and len(r.history) == history
+ok36 = ok36 and state_file.read_bytes() == written
+
+# with nothing drawn a resize returns the view to the origin
+r.clear_canvas()
+r.pan_to(700.0, 700.0)
+root.geometry("940x620")
+settle(700)
+ok36 = ok36 and (r.pan_x, r.pan_y) == (0.0, 0.0)
+
+# no timer is left behind to fire into a closed window
+r.add_shape("circle", 300, 300)
+root.geometry("900x600")
+root.update()
+r.cancel_pending()
+ok36 = ok36 and r.resize_job is None and r.space_release_job is None
+check(36, "a finished window resize recentres the drawing, once, recording nothing", ok36)
+root.destroy()
+
+# ------------------------------------------------------------------------ 37
+root = tk.Tk()
+root.geometry("1000x640")
+c = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".fill")
+root.update()
+root.update_idletasks()
+
+marked = lambda: [col for col, sw in c.fill_swatches.items() if str(sw.cget("highlightbackground")) == "#1f6feb"]
+
+# the pane hides when there is nothing with properties, and Undo stays reachable
+c.select(None)
+root.update()
+ok37 = c.pane_visible is False and not c.pane.winfo_ismapped()
+ok37 = ok37 and c.undo_button.winfo_ismapped()  # Undo lives in the status bar now
+
+wide = c.canvas.winfo_width()
+one = c.add_shape("rectangle", 300, 200)
+root.update()
+narrow = c.canvas.winfo_width()
+ok37 = ok37 and c.pane_visible is True and c.pane.winfo_ismapped() and narrow < wide
+
+# the swatch row shows the current fill and sets a new one
+ok37 = ok37 and marked() == ["#d3d3d3"] and len(c.fill_swatches) == 8
+c.fill_swatches["#7bb661"].event_generate("<Button-1>")
+root.update()
+ok37 = ok37 and c.shapes[one].fill == "#7bb661" and marked() == ["#7bb661"]
+
+# a mixed selection marks nothing
+two = c.add_shape("circle", 700, 400)
+c.select(one)
+c.select(two, add=True)
+ok37 = ok37 and marked() == []
+c.fill_swatches["#e2726e"].event_generate("<Button-1>")
+ok37 = ok37 and c.shapes[one].fill == "#e2726e" and c.shapes[two].fill == "#e2726e" and marked() == ["#e2726e"]
+
+# with group colouring off, the swatch touches only the clicked shape
+c.select(one)
+c.select(two, add=True)
+c.group_selection()
+c.select(one)
+c.fill_swatches["#6c9bd2"].event_generate("<Button-1>")
+ok37 = ok37 and c.shapes[one].fill == "#6c9bd2" and c.shapes[two].fill == "#e2726e"
+
+# a colour change is undoable and recorded once
+history = len(c.history)
+c.fill_swatches["#a184c8"].event_generate("<Button-1>")
+ok37 = ok37 and len(c.history) == history + 1
+c.undo()
+ok37 = ok37 and c.shapes[one].fill == "#6c9bd2"
+
+# hiding and showing the pane must not recentre the drawing
+c.pan_to(1500.0, 1500.0)
+mark = (round(c.pan_x), round(c.pan_y))
+c.select(None)
+root.update()
+end = time.time() + 0.7
+while time.time() < end:
+    root.update()
+    time.sleep(0.01)
+ok37 = ok37 and not c.pane_visible and (round(c.pan_x), round(c.pan_y)) == mark
+c.select(one)
+root.update()
+end = time.time() + 0.7
+while time.time() < end:
+    root.update()
+    time.sleep(0.01)
+ok37 = ok37 and c.pane_visible and (round(c.pan_x), round(c.pan_y)) == mark
+check(37, "the pane carries a fill selector and hides itself when nothing is selected", ok37)
+root.destroy()
+
+# ------------------------------------------------------------------------ 38
+root = tk.Tk()
+root.geometry("1100x700")
+d = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".depthlabel")
+root.update()
+root.update_idletasks()
+
+# label item ids are recreated on every restack, so always read them fresh
+place = lambda item: d.canvas.find_all().index(item)
+
+m1 = d.add_shape("rectangle", 300, 300)
+m2 = d.add_shape("circle", 500, 300)
+outsider = d.add_shape("rectangle", 400, 300)
+d.select(m1)
+d.select(m2, add=True)
+d.group_selection()
+inner = d.root_group(m1)
+d.pane_name.insert(0, "Assembly")
+d.commit_pane()
+d.pane_show.set(True)
+d.on_show_toggled()
+
+# the name sits above its own members
+ok38 = all(place(d.group_labels[inner]) > place(d.items[member]) for member in (m1, m2))
+
+# a shape stacked above the group covers the name
+d.select(outsider)
+d.set_depth("top")
+ok38 = ok38 and place(d.items[outsider]) > place(d.group_labels[inner])
+
+# and stops covering it once it goes below
+d.select(outsider)
+d.set_depth("bottom")
+ok38 = ok38 and place(d.items[outsider]) < place(d.group_labels[inner])
+
+# nesting: each name rides at its own group's depth
+loose = d.add_shape("circle", 900, 300)
+d.select(m1)
+d.select(loose, add=True)
+d.group_selection()
+outer = d.root_group(m1)
+d.pane_name.insert(0, "Outer")
+d.commit_pane()
+d.pane_show.set(True)
+d.on_show_toggled()
+
+ok38 = ok38 and place(d.group_labels[inner]) > place(d.items[m2])
+ok38 = ok38 and place(d.group_labels[outer]) > place(d.group_labels[inner])
+ok38 = ok38 and all(place(d.group_labels[outer]) > place(d.items[m]) for m in d.group_shapes(outer))
+
+# a shape genuinely on top covers both names
+d.select(outsider)
+d.set_depth("top")
+ok38 = ok38 and place(d.items[outsider]) > place(d.group_labels[outer])
+ok38 = ok38 and place(d.items[outsider]) > place(d.group_labels[inner])
+
+# handles stay above everything, the grid below everything
+ok38 = ok38 and min(place(h) for h in d.canvas.find_withtag("handle")) > place(d.group_labels[outer])
+ok38 = ok38 and max(place(g) for g in d.canvas.find_withtag("grid")) < place(d.items[m1])
+
+# the ordering survives a reload
+saved = Path(HOME) / "depthlabel.json"
+d.write_state(saved)
+d.clear_canvas()
+d.load_state(saved, announce=False)
+top_group = next(g for g in d.groups if not d.groups[g].parent)
+top_member = d.group_shapes(top_group)[-1]
+ok38 = ok38 and place(d.group_labels[top_group]) > place(d.items[top_member])
+check(38, "a group's name rides at its group's depth and is covered by shapes above it", ok38)
+root.destroy()
+
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} checks passed")
 if FAIL:
     print("failed:", FAIL)

@@ -121,7 +121,7 @@ Default: **Stippled**.
 
 - A **menu bar** at the top.
 - A **central frame** holding a tabbed view with exactly two tabs, `Canvas` and `Json`.
-- A **status line** at the bottom, showing the result of the last action.
+- A **status line** at the bottom, holding the Undo button and the text of the last action.
 
 The `Canvas` tab holds the drawing surface on the left and the properties pane on the right; the
 canvas expands with the window, the pane keeps a fixed width of about 250 units.
@@ -380,6 +380,20 @@ The canvas shows a window onto the model, positioned by `pan_x`, `pan_y` in mode
 - **Center drawing** — on the View menu at `Ctrl+0` and on the canvas popup — puts the middle of
   the drawing's bounding box in the middle of the viewport. With nothing drawn it returns to the
   origin.
+- **Resizing the window recentres the drawing** once the resize has finished.
+
+`<Configure>` arrives continuously while a window edge is dragged, so recentring is debounced: each
+event restarts a settle timer (about 250 ms) and only the last one recentres. The grid is redrawn
+immediately on every event, so the canvas still tracks the window while it is being dragged.
+
+Two conditions on the recentre:
+
+- The **initial layout is not a resize**. The first `<Configure>` records the size and recentres
+  nothing, so opening a file does not throw away where it put you.
+- A drag in progress defers it: the timer restarts rather than moving the ground under the pointer.
+
+Any pending timer is cancelled when the window is destroyed, so nothing fires into a dead
+interpreter.
 
 **Holding space must be read correctly.** X11 auto-repeat delivers a *release* followed by a press
 for as long as a key is held, so a handler that trusts the first `KeyRelease` disarms the pan a
@@ -441,7 +455,7 @@ a shape moves that shape instead.
 than one shape is selected, each member also gets a dashed marquee.
 
 Handles are drawn above all shapes; the grid is drawn below all shapes; a shape's name label sits
-directly above its own shape.
+directly above its own shape, and a group's name label directly above its topmost member (§16).
 
 ---
 
@@ -568,9 +582,16 @@ Changing a fill also recomputes the label ink colour (§16).
 A shape with a non-empty `name` and `show_name` true displays that name as text centred on it.
 
 A **group** with a non-empty `name` and `show_name` true displays its name centred on the bounding
-box of its members, in the same style. It follows the group as members move or resize, sits above
-every member, and disappears when the group is ungrouped or its name is hidden. Its ink colour is
-chosen against the topmost member's fill.
+box of everything beneath it, in the same style. It follows the group as members move or resize, and
+disappears when the group is ungrouped or its name is hidden. Its ink colour is chosen against the
+topmost member's fill.
+
+**A group's name rides at the group's own depth**, which is the depth of its topmost member. It is
+drawn above every member of that group, and is covered by any shape stacked above them — a group
+name must not float over unrelated shapes that sit in front of it.
+
+Where two group names anchor at the same shape, the enclosing group's name is drawn above the
+nested one.
 
 - The text follows the shape while it is moved or resized.
 - It wraps to the shape's width minus 6 model units.
@@ -585,8 +606,18 @@ chosen against the topmost member's fill.
 
 ## 17. Properties pane
 
-To the right of the canvas. Shows and edits `Name` and `Description`, plus a read-only line
+To the right of the canvas. Shows and edits `Fill`, `Name` and `Description`, plus a read-only line
 identifying what is being edited.
+
+**The pane hides itself when nothing with properties is selected**, giving the canvas the extra
+width. It reappears the moment something is selected.
+
+Showing or hiding the pane resizes the canvas, which must **not** be treated as the user resizing
+the window (§10a) — otherwise every click would recentre the drawing. The toggle produces exactly
+one `<Configure>`; flag it and have the handler consume the flag.
+
+Because the pane comes and goes, the **Undo button lives in the status bar**, not in the pane, so it
+is reachable whether or not anything is selected.
 
 **What the pane edits depends on the selection:**
 
@@ -596,6 +627,15 @@ identifying what is being edited.
 | Several ungrouped shapes | the primary shape | kind, depth, uuid, "n selected, editing this one" |
 | Any member of a group | **the group** | "Group of n shapes · editing the group", group uuid |
 | Nothing | nothing; fields disabled | "No shape selected" |
+
+### Fill
+
+A row of swatches, one per palette colour (§3.2), and a `Custom color...` button. Clicking a swatch
+applies that fill through the same path as the popup's `Color` menu, so the group-colouring rule in
+§15 applies unchanged.
+
+The swatch matching the current fill is outlined. When the selection has more than one fill, no
+swatch is marked.
 
 ### Showing the name on the canvas
 
@@ -618,8 +658,8 @@ group's properties. To edit an individual member's own name and description, ung
 - Escape reverts a field to the stored value.
 - An edit that changes nothing writes nothing and records no undo step.
 - The pane and the Properties window edit the same data and always agree.
-- The Undo button lives here and is enabled whenever the history is non-empty, including when
-  nothing is selected.
+- The Undo button is in the status bar and is enabled whenever the history is non-empty, including
+  when nothing is selected.
 
 ---
 
@@ -774,3 +814,14 @@ An implementation is correct if all of these hold, verifiable without a human at
 35. Ungrouping the outer group removes only that group and leaves both subgroups intact at the top
     level; a second ungroup dissolves one of them while the other survives. A file nesting a group
     inside itself loads without hanging.
+36. A burst of resize events recentres the drawing exactly once, after the burst stops; a pan is
+    left alone while no resize happens; the recentre writes nothing to the state file and records
+    no undo step; and with nothing drawn a resize returns the view to the origin.
+37. The pane is hidden with nothing selected and shown when something is, and the canvas is wider
+    while it is hidden; Undo remains visible throughout. The swatch row marks the current fill,
+    marks nothing for a mixed selection, applies a fill in one undoable step, and honours the
+    group-colouring setting. Showing or hiding the pane does not recentre the drawing.
+38. A group's name is drawn above every member of that group, is covered by a shape stacked above
+    them, and stops being covered when that shape is sent below. With nested groups each name rides
+    at its own group's depth. Handles stay above everything and the grid below everything, and the
+    ordering survives a reload.

@@ -88,6 +88,8 @@ GRID_CM_MAX = 20.0
 HISTORY_LIMIT = 50
 GRID_LINE_LIMIT = 400  # stop drawing the grid rather than fill the canvas with lines
 SPACE_RELEASE_GRACE_MS = 60  # X11 auto-repeat sends release/press pairs; wait before believing one
+RESIZE_SETTLE_MS = 250  # quiet time after the last <Configure> before a resize counts as finished
+SWATCH_SIZE = 18
 
 EXPORT_MARGIN_CM = 1.0
 EXPORT_FILETYPES: tuple[tuple[str, str, str], ...] = (
@@ -294,6 +296,10 @@ class DoodleMyShapes:
         self.pan_origin: tuple[float, float] = (0.0, 0.0)
         self.band_origin: tuple[float, float] = (0.0, 0.0)  # in model units
         self.band_base: list[str] = []  # selection to add to, when the band is additive
+        self.canvas_size: tuple[int, int] | None = None  # None until the first layout
+        self.resize_job: str | None = None
+        self.pane_visible = True
+        self.self_inflicted_layout = False  # set while the pane is showing or hiding itself
 
         # --- history and preferences -----------------------------------------
         self.suspend_autosave = False
@@ -420,7 +426,8 @@ class DoodleMyShapes:
         self._build_popups()
 
     def _build_properties_pane(self, parent: ttk.Frame) -> None:
-        pane = ttk.Frame(parent, padding=(10, 4, 0, 0), width=PANE_WIDTH)
+        self.pane = ttk.Frame(parent, padding=(10, 4, 0, 0), width=PANE_WIDTH)
+        pane = self.pane
         pane.grid(row=0, column=1, sticky=tk.NS)
         pane.grid_propagate(False)
         pane.columnconfigure(0, weight=1)
@@ -429,16 +436,36 @@ class DoodleMyShapes:
         self.pane_subject = ttk.Label(pane, text="No shape selected", foreground="#767676", wraplength=230)
         self.pane_subject.grid(row=1, column=0, sticky=tk.W, pady=(2, 10))
 
-        ttk.Label(pane, text="Name").grid(row=2, column=0, sticky=tk.W)
-        self.pane_name = ttk.Entry(pane)
-        self.pane_name.grid(row=3, column=0, sticky=tk.EW, pady=(2, 10))
+        ttk.Label(pane, text="Fill").grid(row=2, column=0, sticky=tk.W)
+        swatches = ttk.Frame(pane)
+        swatches.grid(row=3, column=0, sticky=tk.W, pady=(2, 2))
+        self.fill_swatches: dict[str, tk.Frame] = {}
+        for name, color in FILL_COLORS:
+            swatch = tk.Frame(
+                swatches,
+                background=color,
+                width=SWATCH_SIZE,
+                height=SWATCH_SIZE,
+                highlightthickness=2,
+                highlightbackground=CANVAS_BG,
+                cursor="hand2",
+            )
+            swatch.pack(side=tk.LEFT, padx=1)
+            swatch.bind("<Button-1>", self._swatch_setter(color))
+            self.fill_swatches[color] = swatch
+        self.custom_fill_button = ttk.Button(pane, text="Custom color...", command=self.choose_custom_fill)
+        self.custom_fill_button.grid(row=4, column=0, sticky=tk.EW, pady=(2, 10))
 
-        ttk.Label(pane, text="Description").grid(row=4, column=0, sticky=tk.W)
+        ttk.Label(pane, text="Name").grid(row=5, column=0, sticky=tk.W)
+        self.pane_name = ttk.Entry(pane)
+        self.pane_name.grid(row=6, column=0, sticky=tk.EW, pady=(2, 10))
+
+        ttk.Label(pane, text="Description").grid(row=7, column=0, sticky=tk.W)
         description_box = ttk.Frame(pane)
-        description_box.grid(row=5, column=0, sticky=tk.NSEW, pady=(2, 8))
+        description_box.grid(row=8, column=0, sticky=tk.NSEW, pady=(2, 8))
         description_box.rowconfigure(0, weight=1)
         description_box.columnconfigure(0, weight=1)
-        pane.rowconfigure(5, weight=1)
+        pane.rowconfigure(8, weight=1)
 
         self.pane_description = tk.Text(description_box, width=24, height=8, wrap=tk.WORD, font=("TkDefaultFont",))
         scroll = ttk.Scrollbar(description_box, orient=tk.VERTICAL, command=self.pane_description.yview)
@@ -447,7 +474,7 @@ class DoodleMyShapes:
         scroll.grid(row=0, column=1, sticky=tk.NS)
 
         visibility = ttk.Frame(pane)
-        visibility.grid(row=6, column=0, sticky=tk.EW, pady=(0, 8))
+        visibility.grid(row=9, column=0, sticky=tk.EW, pady=(0, 8))
         ttk.Label(visibility, text="Name label").pack(side=tk.LEFT)
         self.pane_show = tk.BooleanVar(master=pane, value=True)
         self.pane_show_text = tk.StringVar(master=pane, value="Show")
@@ -460,12 +487,8 @@ class DoodleMyShapes:
         )
         self.show_button.pack(side=tk.RIGHT)
 
-        buttons = ttk.Frame(pane)
-        buttons.grid(row=7, column=0, sticky=tk.EW)
-        self.undo_button = ttk.Button(buttons, text="Undo", command=self.undo, state=tk.DISABLED)
-        self.undo_button.pack(side=tk.LEFT)
-        self.pane_apply = ttk.Button(buttons, text="Apply", command=self.commit_pane)
-        self.pane_apply.pack(side=tk.RIGHT)
+        self.pane_apply = ttk.Button(pane, text="Apply", command=self.commit_pane)
+        self.pane_apply.grid(row=10, column=0, sticky=tk.E)
 
         # Typed text is kept when focus leaves the field, so edits are not lost by clicking away.
         self.pane_name.bind("<Return>", lambda _event: self.commit_pane())
@@ -533,16 +556,25 @@ class DoodleMyShapes:
             menu.bind("<ButtonRelease-3>", self.dismiss_popup)
 
     def _build_status_line(self) -> None:
+        bar = ttk.Frame(self.root, padding=(6, 2))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Undo lives here rather than in the properties pane, because the pane hides itself
+        # when nothing is selected and undo has to stay reachable.
+        self.undo_button = ttk.Button(bar, text="Undo", command=self.undo, state=tk.DISABLED, width=8)
+        self.undo_button.pack(side=tk.LEFT, padx=(0, 6))
+
         self.status = tk.StringVar(value="")
-        status_bar = ttk.Label(self.root, textvariable=self.status, relief=tk.SUNKEN, anchor=tk.W, padding=(8, 3))
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(bar, textvariable=self.status, relief=tk.SUNKEN, anchor=tk.W, padding=(8, 3)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
 
     def _bind_events(self) -> None:
         self.canvas.bind("<Button-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Motion>", self.on_hover)
-        self.canvas.bind("<Configure>", lambda _event: self.draw_grid())
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
         self.canvas.configure(takefocus=True)
 
         # Space arms panning wherever the keyboard happens to be, except inside a text field,
@@ -829,9 +861,36 @@ class DoodleMyShapes:
         self.draw_grid()
         self.restack()
 
+    def nesting_depth(self, group: str) -> int:
+        """How many groups enclose this one. Zero at the top level."""
+        depth, current, seen = 0, group, {group}
+        while current in self.groups and self.groups[current].parent:
+            current = self.groups[current].parent
+            if current in seen:
+                break
+            seen.add(current)
+            depth += 1
+        return depth
+
+    def label_anchors(self) -> dict[str, list[str]]:
+        """Shape -> the group labels that ride at that shape's depth.
+
+        A group's name belongs at the group's own depth, which is the depth of its topmost
+        member. Anything stacked above that member covers the name, as it should.
+        """
+        anchors: dict[str, list[str]] = {}
+        for group in self.group_labels:
+            members = self.group_shapes(group)
+            if members:
+                anchors.setdefault(members[-1], []).append(group)
+        for riders in anchors.values():
+            riders.sort(key=self.nesting_depth, reverse=True)  # innermost first, so it ends lowest
+        return anchors
+
     def restack(self) -> None:
         """Make the canvas stacking order match the recorded depths."""
         self.render_group_labels()  # they follow their members, so rebuild before restacking
+        anchors = self.label_anchors()
         for identifier in self.by_depth():
             item = self.items.get(identifier)
             if item is None:
@@ -840,7 +899,8 @@ class DoodleMyShapes:
             label = self.labels.get(identifier)
             if label is not None:
                 self.canvas.tag_raise(label, item)  # a name stays on its own shape
-        self.canvas.tag_raise(TAG_GROUP_LABEL)  # a group's name sits above all its members
+            for group in anchors.get(identifier, []):
+                self.canvas.tag_raise(self.group_labels[group])
         self.canvas.tag_raise(TAG_HANDLE)
         self.canvas.tag_lower(TAG_GRID)
 
@@ -1269,6 +1329,7 @@ class DoodleMyShapes:
             self.render(identifier)  # the name may need a lighter or darker ink
 
         self.restack()
+        self.refresh_fill_row()
         self.autosave("recolor")
         subject = self.kind_of(targets[0]) if len(targets) == 1 else f"{len(targets)} shapes"
         held_back = len(selected) - len(targets)
@@ -1341,6 +1402,39 @@ class DoodleMyShapes:
         self.pane_description.configure(state=state)
         self.pane_apply.configure(state=state)
         self.refresh_show_button()
+        self.refresh_fill_row()
+        self.update_pane_visibility()
+
+    def _swatch_setter(self, color: str) -> Callable[[tk.Event], None]:
+        def apply(_event: tk.Event) -> None:
+            if self.pane_target is not None:
+                self.set_fill(color)
+
+        return apply
+
+    def refresh_fill_row(self) -> None:
+        """Mark the swatch matching the current fill, and grey the row out when it cannot be used."""
+        usable = self.pane_target is not None
+        fills = {self.shapes[identifier].fill for identifier in self.fill_targets()}
+        current = fills.pop() if len(fills) == 1 else ""
+        for color, swatch in self.fill_swatches.items():
+            chosen = usable and color.lower() == current.lower()
+            swatch.configure(highlightbackground=HANDLE_OUTLINE if chosen else CANVAS_BG)
+        self.custom_fill_button.configure(state=tk.NORMAL if usable else tk.DISABLED)
+
+    def update_pane_visibility(self) -> None:
+        """Show the pane only when there is something with properties to edit."""
+        wanted = self.pane_target is not None
+        if wanted == self.pane_visible:
+            return
+        self.pane_visible = wanted
+        # This resizes the canvas. The single <Configure> it produces must not be mistaken for
+        # the user dragging the window edge, so flag it and let the handler consume the flag.
+        self.self_inflicted_layout = True
+        if wanted:
+            self.pane.grid()
+        else:
+            self.pane.grid_remove()
 
     def refresh_show_button(self) -> None:
         """The toggle reads the current state, and is only usable once there is a name to show."""
@@ -1464,6 +1558,37 @@ class DoodleMyShapes:
         self.render_group_labels()
         self.draw_grid()
         self.redraw_selection()
+
+    def on_canvas_configure(self, event: tk.Event) -> None:
+        """Redraw the grid for the new size, and recentre once the resize has settled."""
+        size = (int(event.width), int(event.height))
+        if size == self.canvas_size:
+            return
+
+        first_layout = self.canvas_size is None
+        self.canvas_size = size
+        self.draw_grid()
+        if first_layout:  # the initial layout is not a resize
+            return
+        if self.self_inflicted_layout:  # the pane appearing or disappearing
+            self.self_inflicted_layout = False
+            return
+        self.schedule_recentre()
+
+    def schedule_recentre(self) -> None:
+        """Restart the settle timer. <Configure> arrives continuously while a window is dragged."""
+        if self.resize_job is not None:
+            self.root.after_cancel(self.resize_job)
+        self.resize_job = self.root.after(RESIZE_SETTLE_MS, self.on_resize_settled)
+
+    def on_resize_settled(self) -> None:
+        self.resize_job = None
+        if not self.canvas.winfo_exists():
+            return
+        if self.drag_mode is not None:  # wait rather than move the ground under a drag
+            self.schedule_recentre()
+            return
+        self.center_drawing()
 
     def center_drawing(self) -> None:
         """Put the middle of the drawing in the middle of the viewport."""
@@ -2274,12 +2399,14 @@ class DoodleMyShapes:
 
     def cancel_pending(self) -> None:
         """Drop any timer that would otherwise fire into a window that no longer exists."""
-        if self.space_release_job is not None:
-            try:
-                self.root.after_cancel(self.space_release_job)
-            except tk.TclError:
-                pass
-            self.space_release_job = None
+        for job in (self.space_release_job, self.resize_job):
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self.space_release_job = None
+        self.resize_job = None
 
     def on_destroy(self, event: tk.Event) -> None:
         if event.widget is self.root:  # fires for every child too, so check it is the window
