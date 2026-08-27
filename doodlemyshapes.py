@@ -83,6 +83,8 @@ GRID_CM_MIN = 0.1
 GRID_CM_MAX = 20.0
 
 HISTORY_LIMIT = 50
+GRID_LINE_LIMIT = 400  # stop drawing the grid rather than fill the canvas with lines
+SPACE_RELEASE_GRACE_MS = 60  # X11 auto-repeat sends release/press pairs; wait before believing one
 
 EXPORT_MARGIN_CM = 1.0
 EXPORT_FILETYPES: tuple[tuple[str, str, str], ...] = (
@@ -109,6 +111,7 @@ TAG_HANDLE = "handle"
 TAG_GRID = "grid"
 TAG_LABEL = "label"
 TAG_MARK = "marquee"
+TAG_GROUP_LABEL = "group-label"
 
 HANDLE_CURSORS = {
     "nw": "top_left_corner",
@@ -154,6 +157,7 @@ class ShapeRecord:
     description: str = ""
     depth: int = 0
     group: str = ""
+    show_name: bool = True  # a shape shows its name by default
 
     @property
     def box(self) -> Box:
@@ -177,6 +181,7 @@ class ShapeRecord:
             "fill": self.fill,
             "depth": self.depth,
             "group": self.group or None,
+            "show_name": self.show_name,
             "position": {"x": round(self.x, 2), "y": round(self.y, 2)},
             "size": {"width": round(self.width, 2), "height": round(self.height, 2)},
         }
@@ -208,65 +213,27 @@ class ShapeRecord:
             description=str(entry.get("description") or ""),
             depth=depth if isinstance(depth, int) and not isinstance(depth, bool) else fallback_depth,
             group=str(entry.get("group") or ""),
+            show_name=bool(entry.get("show_name", True)),
         )
 
 
-class PropertiesDialog(tk.Toplevel):
-    """Modal editor for a shape's name and description.
+@dataclass
+class GroupRecord:
+    """A group of shapes. Membership lives on the shapes; this holds the group's own properties."""
 
-    Cancel (or Escape, or the window manager's close button) throws the edits away;
-    Save hands them back through `result`.
-    """
+    uuid: str = field(default_factory=lambda: str(uuid.uuid4()))
+    name: str = ""
+    description: str = ""
+    show_name: bool = False  # a group keeps its name hidden by default
 
-    def __init__(self, parent: tk.Misc, record: ShapeRecord) -> None:
-        super().__init__(parent)
-        self.result: tuple[str, str] | None = None
-
-        self.title(f"{record.kind.capitalize()} properties")
-        self.transient(parent.winfo_toplevel())
-        self.resizable(False, False)
-
-        body = ttk.Frame(self, padding=12)
-        body.pack(fill=tk.BOTH, expand=True)
-        body.columnconfigure(1, weight=1)
-
-        ttk.Label(body, text="Name").grid(row=0, column=0, sticky=tk.W, pady=(0, 6), padx=(0, 8))
-        self.name_entry = ttk.Entry(body, width=42)
-        self.name_entry.insert(0, record.name)
-        self.name_entry.grid(row=0, column=1, sticky=tk.EW, pady=(0, 6))
-
-        ttk.Label(body, text="Description").grid(row=1, column=0, sticky=tk.NW, padx=(0, 8))
-        self.description_text = tk.Text(body, width=42, height=5, wrap=tk.WORD, font=("TkDefaultFont",))
-        self.description_text.insert("1.0", record.description)
-        self.description_text.grid(row=1, column=1, sticky=tk.EW)
-
-        ttk.Label(body, text=record.uuid, foreground="#767676").grid(row=2, column=1, sticky=tk.W, pady=(6, 0))
-
-        buttons = ttk.Frame(body)
-        buttons.grid(row=3, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
-        ttk.Button(buttons, text="Save", command=self.save).pack(side=tk.RIGHT, padx=(0, 6))
-
-        self.bind("<Escape>", lambda _event: self.cancel())
-        self.name_entry.bind("<Return>", lambda _event: self.save())
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-
-        self.name_entry.focus_set()
-        self._center_on(parent.winfo_toplevel())
-
-    def _center_on(self, parent: tk.Misc) -> None:
-        self.update_idletasks()
-        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
-        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
-        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-    def save(self) -> None:
-        self.result = (self.name_entry.get().strip(), self.description_text.get("1.0", tk.END).strip())
-        self.destroy()
-
-    def cancel(self) -> None:
-        self.result = None  # nothing is carried back out
-        self.destroy()
+    def to_json(self, members: list[str]) -> dict[str, Any]:
+        return {
+            "uuid": self.uuid,
+            "name": self.name,
+            "description": self.description,
+            "show_name": self.show_name,
+            "members": members,
+        }
 
 
 class DoodleMyShapes:
@@ -289,16 +256,18 @@ class DoodleMyShapes:
 
         # --- the model ---------------------------------------------------
         self.shapes: dict[str, ShapeRecord] = {}  # uuid -> record, the only source of geometry
+        self.groups: dict[str, GroupRecord] = {}  # group uuid -> its own name and description
 
         # --- the view -----------------------------------------------------
         self.items: dict[str, int] = {}  # uuid -> canvas shape item
-        self.labels: dict[str, int] = {}  # uuid -> canvas text item
+        self.labels: dict[str, int] = {}  # shape uuid -> canvas text item
+        self.group_labels: dict[str, int] = {}  # group uuid -> canvas text item
         self.owners: dict[int, str] = {}  # canvas shape item -> uuid
 
         # --- interaction ---------------------------------------------------
         self.selection: list[str] = []
         self.selected: str | None = None
-        self.pane_item: str | None = None
+        self.pane_target: tuple[str, str] | None = None  # ("shape" | "group", uuid)
         self.drag_mode: str | None = None
         self.drag_handle: str | None = None
         self.drag_start: tuple[float, float] = (0.0, 0.0)
@@ -306,6 +275,16 @@ class DoodleMyShapes:
         self.drag_boxes: dict[str, Box] = {}
         self.drag_min: tuple[float, float] = (MIN_SIZE, MIN_SIZE)
         self.menu_point: tuple[float, float] = (0.0, 0.0)
+
+        # --- the viewport ---------------------------------------------------
+        # Panning moves the window onto the model; it never touches the shapes, so it is
+        # not part of the document, not undoable, and negative model coordinates are fine.
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self.space_held = False
+        self.space_release_job: str | None = None
+        self.pan_from: tuple[float, float] = (0.0, 0.0)  # pointer in screen units when the pan began
+        self.pan_origin: tuple[float, float] = (0.0, 0.0)
 
         # --- history and preferences -----------------------------------------
         self.suspend_autosave = False
@@ -318,6 +297,7 @@ class DoodleMyShapes:
         self.grid_line = tk.StringVar(master=root, value=GRID_LINE_DEFAULT)
         self.grid_cm = tk.DoubleVar(master=root, value=GRID_CM)
         self.confirm_deletes = tk.BooleanVar(master=root, value=True)
+        self.color_groups = tk.BooleanVar(master=root, value=False)  # colouring a whole group is opt-in
 
         self._build_menu_bar()
         self._build_central_frame()
@@ -356,6 +336,11 @@ class DoodleMyShapes:
             variable=self.confirm_deletes,
             command=self.on_confirm_setting_changed,
         )
+        edit_menu.add_checkbutton(
+            label="Allow coloring a whole group",
+            variable=self.color_groups,
+            command=self.on_color_groups_changed,
+        )
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
 
         shape_menu = tk.Menu(menu_bar, tearoff=False)
@@ -393,6 +378,8 @@ class DoodleMyShapes:
         grid_menu.add_cascade(label="Grid size", menu=size_menu)
 
         view_menu.add_cascade(label="Grid", menu=grid_menu)
+        view_menu.add_separator()
+        view_menu.add_command(label="Center drawing", accelerator="Ctrl+0", command=self.center_drawing)
         view_menu.add_separator()
         view_menu.add_command(label="Canvas tab", command=lambda: self.show_tab(0))
         view_menu.add_command(label="Json tab", command=lambda: self.show_tab(1))
@@ -450,8 +437,22 @@ class DoodleMyShapes:
         self.pane_description.grid(row=0, column=0, sticky=tk.NSEW)
         scroll.grid(row=0, column=1, sticky=tk.NS)
 
+        visibility = ttk.Frame(pane)
+        visibility.grid(row=6, column=0, sticky=tk.EW, pady=(0, 8))
+        ttk.Label(visibility, text="Name label").pack(side=tk.LEFT)
+        self.pane_show = tk.BooleanVar(master=pane, value=True)
+        self.pane_show_text = tk.StringVar(master=pane, value="Show")
+        self.show_button = ttk.Checkbutton(
+            visibility,
+            style="Toolbutton",
+            textvariable=self.pane_show_text,
+            variable=self.pane_show,
+            command=self.on_show_toggled,
+        )
+        self.show_button.pack(side=tk.RIGHT)
+
         buttons = ttk.Frame(pane)
-        buttons.grid(row=6, column=0, sticky=tk.EW)
+        buttons.grid(row=7, column=0, sticky=tk.EW)
         self.undo_button = ttk.Button(buttons, text="Undo", command=self.undo, state=tk.DISABLED)
         self.undo_button.pack(side=tk.LEFT)
         self.pane_apply = ttk.Button(buttons, text="Apply", command=self.commit_pane)
@@ -461,8 +462,8 @@ class DoodleMyShapes:
         self.pane_name.bind("<Return>", lambda _event: self.commit_pane())
         self.pane_name.bind("<FocusOut>", lambda _event: self.commit_pane())
         self.pane_description.bind("<FocusOut>", lambda _event: self.commit_pane())
-        self.pane_name.bind("<Escape>", lambda _event: self.show_in_pane(self.pane_item))
-        self.pane_description.bind("<Escape>", lambda _event: self.show_in_pane(self.pane_item))
+        self.pane_name.bind("<Escape>", lambda _event: self.show_in_pane(self.pane_target))
+        self.pane_description.bind("<Escape>", lambda _event: self.show_in_pane(self.pane_target))
 
         self.show_in_pane(None)
 
@@ -496,6 +497,8 @@ class DoodleMyShapes:
         self.canvas_popup = tk.Menu(self.canvas, tearoff=False)
         self.canvas_popup.add_command(label="Rectangle", command=lambda: self.add_shape_at_menu_point("rectangle"))
         self.canvas_popup.add_command(label="Circle", command=lambda: self.add_shape_at_menu_point("circle"))
+        self.canvas_popup.add_separator()
+        self.canvas_popup.add_command(label="Center drawing", command=self.center_drawing)
 
         self.shape_popup = tk.Menu(self.canvas, tearoff=False)
         self.color_menu = tk.Menu(self.shape_popup, tearoff=False)
@@ -517,13 +520,10 @@ class DoodleMyShapes:
         self.shape_popup.add_separator()
         self.shape_popup.add_command(label="Group selection", command=self.group_selection)
         self.shape_popup.add_command(label="Ungroup", command=self.ungroup_selection)
-        self.shape_popup.add_separator()
-        self.shape_popup.add_command(label="Properties...", command=self.open_properties)
 
         # Releasing the right button while no entry is highlighted takes the menu back down.
         for menu in (self.canvas_popup, self.shape_popup, self.color_menu, self.depth_menu):
             menu.bind("<ButtonRelease-3>", self.dismiss_popup)
-            menu.bind("<ButtonRelease-2>", self.dismiss_popup)
 
     def _build_status_line(self) -> None:
         self.status = tk.StringVar(value="")
@@ -536,10 +536,20 @@ class DoodleMyShapes:
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Motion>", self.on_hover)
         self.canvas.bind("<Configure>", lambda _event: self.draw_grid())
+        self.canvas.configure(takefocus=True)
+
+        # Space arms panning wherever the keyboard happens to be, except inside a text field,
+        # so there is no need to click the canvas first.
+        self.root.bind_all("<KeyPress-space>", self.on_space_down)
+        self.root.bind_all("<KeyRelease-space>", self.on_space_up)
+
+        # The middle button pans too, with no key involved at all.
+        self.canvas.bind("<Button-2>", self.on_middle_press)
+        self.canvas.bind("<B2-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-2>", self.on_middle_release)
         self.notebook.bind("<<NotebookTabChanged>>", lambda _event: self.refresh_json_view())
 
-        self.canvas.bind("<Button-3>", self.on_popup)
-        self.canvas.bind("<Button-2>", self.on_popup)  # macOS trackpads
+        self.canvas.bind("<Button-3>", self.on_popup)  # right click only; the middle button is free
 
         self.root.bind("<Delete>", lambda _event: self.delete_selected())
         self.root.bind("<BackSpace>", lambda _event: self.delete_selected())
@@ -551,6 +561,7 @@ class DoodleMyShapes:
         self.root.bind("<Control-q>", lambda _event: self.on_close())
         self.root.bind("<Control-z>", lambda _event: self.undo())
         self.root.bind("<Control-g>", lambda _event: self.toggle_grid(flip=True))
+        self.root.bind("<Control-Key-0>", lambda _event: self.center_drawing())
         self.root.bind("<Control-G>", lambda _event: self.group_selection())  # Ctrl+Shift+G
         self.root.bind("<Control-U>", lambda _event: self.ungroup_selection())
         self.root.bind("<Control-Up>", lambda _event: self.set_depth("up"))
@@ -568,20 +579,39 @@ class DoodleMyShapes:
         except tk.TclError:
             return 1.0
 
-    def to_screen(self, value: float) -> float:
+    def length_to_screen(self, value: float) -> float:
+        """Scale a distance. Distances are unaffected by where the view is panned to."""
         return value * self.display_scale
 
-    def to_model(self, value: float) -> float:
+    def length_to_model(self, value: float) -> float:
         scale = self.display_scale
         return value / scale if scale else value
 
-    def screen_box(self, box: Box) -> Box:
+    def point_to_screen(self, x: float, y: float) -> tuple[float, float]:
+        """Place a model point on the canvas, taking the pan offset into account."""
         scale = self.display_scale
-        return box[0] * scale, box[1] * scale, box[2] * scale, box[3] * scale
+        return (x - self.pan_x) * scale, (y - self.pan_y) * scale
+
+    def point_to_model(self, sx: float, sy: float) -> tuple[float, float]:
+        scale = self.display_scale or 1.0
+        return sx / scale + self.pan_x, sy / scale + self.pan_y
+
+    def screen_box(self, box: Box) -> Box:
+        x1, y1 = self.point_to_screen(box[0], box[1])
+        x2, y2 = self.point_to_screen(box[2], box[3])
+        return x1, y1, x2, y2
+
+    def viewport(self) -> Box:
+        """The part of the model currently visible, in model units."""
+        width = max(self.canvas.winfo_width(), 1)
+        height = max(self.canvas.winfo_height(), 1)
+        left, top = self.point_to_model(0, 0)
+        right, bottom = self.point_to_model(width, height)
+        return left, top, right, bottom
 
     def pointer(self, event: tk.Event) -> tuple[float, float]:
         """Pointer position in model units."""
-        return self.to_model(self.canvas.canvasx(event.x)), self.to_model(self.canvas.canvasy(event.y))
+        return self.point_to_model(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
 
     @staticmethod
     def cm_to_model(value: float) -> float:
@@ -617,13 +647,13 @@ class DoodleMyShapes:
         return round(value / cell) * cell
 
     def draw_grid(self) -> None:
-        """(Re)draw the grid to fit the canvas, in the chosen colour and line type."""
+        """(Re)draw the grid across whatever part of the model is currently in view."""
         self.canvas.delete(TAG_GRID)
         if not self.show_grid.get():
             return
 
         width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
-        step = self.to_screen(self.cell)
+        step = self.length_to_screen(self.cell)
         if step < 2 or width < 2 or height < 2:  # not mapped yet, or an absurd pitch
             return
 
@@ -631,11 +661,18 @@ class DoodleMyShapes:
         dash = GRID_LINE_TYPES.get(self.grid_line.get(), GRID_LINE_TYPES[GRID_LINE_DEFAULT])
         pattern = dash if dash else ""  # Tk wants an empty pattern, not (), for a solid line
 
-        for index in range(1, int(width / step) + 1):
-            x = index * step
+        cell = self.cell
+        left, top, right, bottom = self.viewport()
+        columns = range(math.ceil(left / cell), math.floor(right / cell) + 1)
+        rows = range(math.ceil(top / cell), math.floor(bottom / cell) + 1)
+        if len(columns) + len(rows) > GRID_LINE_LIMIT:  # a wash of lines helps nobody
+            return
+
+        for index in columns:
+            x, _ = self.point_to_screen(index * cell, 0)
             self.canvas.create_line(x, 0, x, height, fill=color, dash=pattern, tags=(TAG_GRID,))
-        for index in range(1, int(height / step) + 1):
-            y = index * step
+        for index in rows:
+            _, y = self.point_to_screen(0, index * cell)
             self.canvas.create_line(0, y, width, y, fill=color, dash=pattern, tags=(TAG_GRID,))
 
         self.canvas.tag_lower(TAG_GRID)  # always behind the shapes
@@ -707,16 +744,15 @@ class DoodleMyShapes:
         existing = self.labels.pop(identifier, None)
         if existing is not None:
             self.canvas.delete(existing)
-        if record is None or not record.name:
+        if record is None or not record.name or not record.show_name:
             return
 
         cx, cy = record.center
         label = self.canvas.create_text(
-            self.to_screen(cx),
-            self.to_screen(cy),
+            *self.point_to_screen(cx, cy),
             text=record.name,
             fill=ink_for(record.fill),
-            width=max(self.to_screen(record.width - 6), 10),  # wrap inside the shape
+            width=max(self.length_to_screen(record.width - 6), 10),  # wrap inside the shape
             justify=tk.CENTER,
             tags=(TAG_LABEL,),
         )
@@ -724,6 +760,40 @@ class DoodleMyShapes:
         item = self.items.get(identifier)
         if item is not None:
             self.canvas.tag_raise(label, item)
+
+    def group_box(self, group: str) -> Box | None:
+        """Bounding box of a group's members, in model units."""
+        boxes = [self.shapes[member].box for member in self.group_index().get(group, [])]
+        if not boxes:
+            return None
+        return (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+
+    def render_group_labels(self) -> None:
+        """Draw the name of every group that is showing one, centred on the group."""
+        self.canvas.delete(TAG_GROUP_LABEL)
+        self.group_labels.clear()
+        members_by_group = self.group_index()
+        for identifier, group in self.groups.items():
+            members = members_by_group.get(identifier, [])
+            if not group.name or not group.show_name or not members:
+                continue
+            box = self.group_box(identifier)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            self.group_labels[identifier] = self.canvas.create_text(
+                *self.point_to_screen((x1 + x2) / 2, (y1 + y2) / 2),
+                text=group.name,
+                fill=ink_for(self.shapes[members[-1]].fill),  # legible over the topmost member
+                width=max(self.length_to_screen(x2 - x1 - 6), 10),
+                justify=tk.CENTER,
+                tags=(TAG_GROUP_LABEL,),
+            )
 
     def forget(self, identifier: str) -> None:
         """Remove one shape's canvas items."""
@@ -739,10 +809,12 @@ class DoodleMyShapes:
         """Rebuild the whole view from the model."""
         self.canvas.delete(TAG_SHAPE)
         self.canvas.delete(TAG_LABEL)
+        self.canvas.delete(TAG_GROUP_LABEL)
         self.canvas.delete(TAG_HANDLE)
         self.canvas.delete(TAG_MARK)
         self.items.clear()
         self.labels.clear()
+        self.group_labels.clear()
         self.owners.clear()
         for identifier in self.by_depth():
             self.render(identifier)
@@ -751,6 +823,7 @@ class DoodleMyShapes:
 
     def restack(self) -> None:
         """Make the canvas stacking order match the recorded depths."""
+        self.render_group_labels()  # they follow their members, so rebuild before restacking
         for identifier in self.by_depth():
             item = self.items.get(identifier)
             if item is None:
@@ -759,6 +832,7 @@ class DoodleMyShapes:
             label = self.labels.get(identifier)
             if label is not None:
                 self.canvas.tag_raise(label, item)  # a name stays on its own shape
+        self.canvas.tag_raise(TAG_GROUP_LABEL)  # a group's name sits above all its members
         self.canvas.tag_raise(TAG_HANDLE)
         self.canvas.tag_lower(TAG_GRID)
 
@@ -807,11 +881,8 @@ class DoodleMyShapes:
 
     def add_shape_at_center(self, kind: str) -> None:
         self.canvas.update_idletasks()
-        self.add_shape(
-            kind,
-            self.to_model(self.canvas.winfo_width() / 2),
-            self.to_model(self.canvas.winfo_height() / 2),
-        )
+        left, top, right, bottom = self.viewport()
+        self.add_shape(kind, (left + right) / 2, (top + bottom) / 2)
 
     def add_shape(self, kind: str, cx: float, cy: float) -> str:
         """Draw a new shape centred near (cx, cy) in model units, snapped to the grid."""
@@ -862,8 +933,9 @@ class DoodleMyShapes:
 
     def select_items(self, identifiers: list[str], primary: str | None) -> None:
         """Replace the selection. `primary` is the one the properties pane edits."""
-        if primary != self.pane_item:
-            self.commit_pane()  # don't lose text typed for the shape we are leaving
+        target = self.target_for(primary)
+        if target != self.pane_target:
+            self.commit_pane()  # don't lose text typed for whatever we are leaving
 
         seen: dict[str, None] = {}  # an ordered set: keep click order, drop duplicates
         for identifier in identifiers:
@@ -876,7 +948,7 @@ class DoodleMyShapes:
         self.selected = primary
 
         self.redraw_selection()
-        self.show_in_pane(primary)
+        self.show_in_pane(self.target_for(primary))
         if primary is None:
             self.set_status("Nothing selected.")
         elif len(self.selection) > 1:
@@ -928,9 +1000,9 @@ class DoodleMyShapes:
                     mx1 - 2, my1 - 2, mx2 + 2, my2 + 2, outline=HANDLE_OUTLINE, dash=MARQUEE_DASH, tags=(TAG_MARK,)
                 )
 
-        radius = self.to_screen(HANDLE_RADIUS)
+        radius = self.length_to_screen(HANDLE_RADIUS)
         for name, (hx, hy) in self.handle_positions().items():
-            sx, sy = self.to_screen(hx), self.to_screen(hy)
+            sx, sy = self.point_to_screen(hx, hy)
             self.canvas.create_rectangle(
                 sx - radius,
                 sy - radius,
@@ -992,12 +1064,15 @@ class DoodleMyShapes:
             self.set_status("Shift-click a second shape before grouping.")
             return
 
-        identifier = str(uuid.uuid4())
+        group = GroupRecord()
+        self.groups[group.uuid] = group
         for member in self.selection:
-            self.shapes[member].group = identifier
+            self.shapes[member].group = group.uuid
+        self.prune_groups()
         self.redraw_selection()
+        self.show_in_pane(self.target_for(self.selected))  # the pane now edits the group
         self.autosave("grouping")
-        self.set_status(f"Grouped {len(self.selection)} shapes as {identifier[:8]}.")
+        self.set_status(f"Grouped {len(self.selection)} shapes as {group.uuid[:8]}.")
 
     def ungroup_selection(self) -> None:
         grouped = [member for member in self.selection if self.shapes[member].group]
@@ -1007,9 +1082,19 @@ class DoodleMyShapes:
 
         for member in grouped:
             self.shapes[member].group = ""
+        self.prune_groups()
         self.redraw_selection()
+        self.show_in_pane(self.target_for(self.selected))
         self.autosave("ungrouping")
         self.set_status(f"Ungrouped {len(grouped)} shapes.")
+
+    def prune_groups(self) -> None:
+        """Forget groups that no longer have any members, so the document stays tidy."""
+        alive = {record.group for record in self.shapes.values() if record.group}
+        for identifier in [key for key in self.groups if key not in alive]:
+            del self.groups[identifier]
+            if self.pane_target == ("group", identifier):
+                self.pane_target = None
 
     # ------------------------------------------------------------------ depth
 
@@ -1052,12 +1137,27 @@ class DoodleMyShapes:
 
     # ------------------------------------------------------------- fill color
 
+    def fill_targets(self) -> list[str]:
+        """Which selected shapes a colour change applies to.
+
+        Colouring a whole group is opt-in. While it is off, a grouped shape is recoloured on its
+        own - the one the popup was opened over - and its group mates are left alone. Shapes that
+        merely happen to be shift-selected together are not a group and are all recoloured.
+        """
+        selected = [identifier for identifier in self.selection if identifier in self.shapes]
+        if self.color_groups.get():
+            return selected
+        return [
+            identifier for identifier in selected if not self.shapes[identifier].group or identifier == self.selected
+        ]
+
     def set_fill(self, color: str) -> None:
-        targets = [identifier for identifier in self.selection if identifier in self.shapes]
-        if not targets:
+        selected = [identifier for identifier in self.selection if identifier in self.shapes]
+        if not selected:
             self.set_status("Right-click a shape to change its fill.")
             return
 
+        targets = self.fill_targets()
         for identifier in targets:
             self.shapes[identifier].fill = color
             self.render(identifier)  # the name may need a lighter or darker ink
@@ -1065,7 +1165,16 @@ class DoodleMyShapes:
         self.restack()
         self.autosave("recolor")
         subject = self.kind_of(targets[0]) if len(targets) == 1 else f"{len(targets)} shapes"
-        self.set_status(f"{subject.capitalize()} filled with {color}.")
+        held_back = len(selected) - len(targets)
+        note = f" {held_back} group mate(s) left alone; enable group colouring to include them." if held_back else ""
+        self.set_status(f"{subject.capitalize()} filled with {color}.{note}")
+
+    def on_color_groups_changed(self) -> None:
+        self.autosave("group colouring setting")
+        if self.color_groups.get():
+            self.set_status("Colouring now applies to every shape in a group.")
+        else:
+            self.set_status("Colouring now applies to one shape at a time within a group.")
 
     def choose_custom_fill(self) -> None:
         record = self.shapes.get(self.selected) if self.selected is not None else None
@@ -1077,10 +1186,25 @@ class DoodleMyShapes:
 
     # ------------------------------------------------------------- properties
 
-    def show_in_pane(self, identifier: str | None) -> None:
-        """Point the side pane at a shape, or empty it when nothing is selected."""
-        record = self.shapes.get(identifier) if identifier is not None else None
-        self.pane_item = identifier if record is not None else None
+    def target_for(self, identifier: str | None) -> tuple[str, str] | None:
+        """What the pane edits for a given primary shape: its group if it has one, else itself."""
+        if identifier is None or identifier not in self.shapes:
+            return None
+        group = self.shapes[identifier].group
+        if group and group in self.groups:
+            return "group", group
+        return "shape", identifier
+
+    def target_record(self, target: tuple[str, str] | None) -> ShapeRecord | GroupRecord | None:
+        if target is None:
+            return None
+        kind, identifier = target
+        return self.groups.get(identifier) if kind == "group" else self.shapes.get(identifier)
+
+    def show_in_pane(self, target: tuple[str, str] | None) -> None:
+        """Point the side pane at a shape or a group, or empty it when nothing is selected."""
+        record = self.target_record(target)
+        self.pane_target = target if record is not None else None
 
         state: Literal["normal", "disabled"] = "normal" if record is not None else "disabled"
         self.pane_name.configure(state=tk.NORMAL)
@@ -1090,10 +1214,13 @@ class DoodleMyShapes:
 
         if record is None:
             self.pane_subject.configure(text="No shape selected")
+        elif isinstance(record, GroupRecord):
+            members = len(self.group_index().get(record.uuid, []))
+            self.pane_subject.configure(text=f"Group of {members} shapes · editing the group\n{record.uuid}")
+            self.pane_name.insert(0, record.name)
+            self.pane_description.insert("1.0", record.description)
         else:
             summary = f"{record.kind.capitalize()} · depth {record.depth}"
-            if record.group:
-                summary += f" · group {record.group[:8]}"
             if len(self.selection) > 1:
                 summary += f" · {len(self.selection)} selected, editing this one"
             self.pane_subject.configure(text=f"{summary}\n{record.uuid}")
@@ -1103,14 +1230,40 @@ class DoodleMyShapes:
         self.pane_name.configure(state=state)
         self.pane_description.configure(state=state)
         self.pane_apply.configure(state=state)
+        self.refresh_show_button()
+
+    def refresh_show_button(self) -> None:
+        """The toggle reads the current state, and is only usable once there is a name to show."""
+        record = self.target_record(self.pane_target)
+        shown = bool(record.show_name) if record is not None else True
+        self.pane_show.set(shown)
+        self.pane_show_text.set("Show" if shown else "Hide")
+        self.show_button.configure(state=tk.NORMAL if record is not None and record.name else tk.DISABLED)
+
+    def on_show_toggled(self) -> None:
+        """Flip whether the name is drawn. The button then reads the new state."""
+        target = self.pane_target
+        record = self.target_record(target)
+        if target is None or record is None or not record.name:
+            self.refresh_show_button()
+            return
+
+        record.show_name = bool(self.pane_show.get())
+        self.pane_show_text.set("Show" if record.show_name else "Hide")
+        if isinstance(record, ShapeRecord):
+            self.render_label(target[1])
+            subject = record.kind
+        else:
+            subject = "group"
+        self.restack()
+        self.autosave(f"name visibility of the {subject}")
+        self.set_status(f"Name of the {subject} is now {'shown' if record.show_name else 'hidden'}.")
 
     def commit_pane(self) -> None:
-        """Write whatever is in the pane back to the shape it belongs to."""
-        identifier = self.pane_item
-        if identifier is None:
-            return
-        record = self.shapes.get(identifier)
-        if record is None:
+        """Write whatever is in the pane back to the shape or group it belongs to."""
+        target = self.pane_target
+        record = self.target_record(target)
+        if target is None or record is None:
             return
 
         name = self.pane_name.get().strip()
@@ -1119,39 +1272,112 @@ class DoodleMyShapes:
             return  # nothing typed, so nothing to save
 
         record.name, record.description = name, description
-        self.render_label(identifier)
-        self.restack()
-        self.autosave(f"edit of {record.kind} properties")
+        if isinstance(record, ShapeRecord):
+            self.render_label(target[1])
+            self.restack()
+            self.autosave(f"edit of {record.kind} properties")
+        else:
+            self.restack()  # the group label may have just appeared or gone
+            self.autosave("edit of group properties")
+        self.refresh_show_button()
         self.set_status(f"Saved properties for {name or record.uuid[:8]}.")
-
-    def open_properties(self) -> None:
-        """Edit the name and description of the shape the popup was opened on."""
-        identifier = self.selected
-        if identifier is None or identifier not in self.shapes:
-            self.set_status("Right-click a shape to edit its properties.")
-            return
-        record = self.shapes[identifier]
-
-        dialog = PropertiesDialog(self.root, record)
-        dialog.grab_set()  # modal: the canvas is off limits until it closes
-        self.root.wait_window(dialog)
-
-        if dialog.result is None:
-            self.set_status(f"Properties of {record.kind} left unchanged.")
-            return
-
-        record.name, record.description = dialog.result
-        self.render_label(identifier)
-        self.restack()
-        self.show_in_pane(identifier)
-        self.autosave(f"edit of {record.kind} properties")
-        self.set_status(f"Saved properties for {record.name or record.uuid[:8]}.")
 
     # ------------------------------------------------------- move and resize
 
+    def typing(self) -> bool:
+        """True when the keyboard belongs to a text field, so space should type a space."""
+        return self.root.focus_get() in (self.pane_name, self.pane_description, self.json_text)
+
+    def on_space_down(self, _event: tk.Event) -> None:
+        """Space arms panning while it is held."""
+        if self.space_release_job is not None:
+            # A release followed straight away by a press is auto-repeat, not a real release.
+            self.root.after_cancel(self.space_release_job)
+            self.space_release_job = None
+        if self.space_held or self.typing():
+            return
+        self.space_held = True
+        self.canvas.configure(cursor="fleur")
+        self.set_status("Hold space and drag to move the view.")
+
+    def on_space_up(self, _event: tk.Event) -> None:
+        """Believe a release only if no repeat press follows within the grace period."""
+        if not self.space_held:
+            return
+        if self.space_release_job is not None:
+            self.root.after_cancel(self.space_release_job)
+        self.space_release_job = self.root.after(SPACE_RELEASE_GRACE_MS, self.release_space)
+
+    def release_space(self) -> None:
+        self.space_release_job = None
+        self.space_held = False
+        if self.drag_mode != "pan":  # a pan already under way runs until the button comes up
+            self.canvas.configure(cursor="")
+
+    def start_pan(self, event: tk.Event) -> None:
+        self.drag_mode = "pan"
+        self.pan_from = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.pan_origin = (self.pan_x, self.pan_y)
+        self.canvas.configure(cursor="fleur")
+
+    def end_pan(self) -> None:
+        self.drag_mode = None
+        self.canvas.configure(cursor="fleur" if self.space_held else "")
+
+    def on_middle_press(self, event: tk.Event) -> None:
+        self.canvas.focus_set()
+        self.start_pan(event)
+
+    def on_middle_release(self, _event: tk.Event) -> None:
+        if self.drag_mode == "pan":
+            self.end_pan()
+
+    def pan_to(self, x: float, y: float) -> None:
+        """Put the model point (x, y) at the top-left of the viewport and redraw."""
+        self.pan_x, self.pan_y = x, y
+        self.reposition()
+
+    def reposition(self) -> None:
+        """Move every canvas item to where the current viewport puts it.
+
+        Coordinates are updated in place rather than recreated, because this runs on every
+        motion event of a pan.
+        """
+        for identifier, item in self.items.items():
+            self.canvas.coords(item, *self.screen_box(self.shapes[identifier].box))
+            label = self.labels.get(identifier)
+            if label is not None:
+                record = self.shapes[identifier]
+                self.canvas.coords(label, *self.point_to_screen(*record.center))
+        self.render_group_labels()
+        self.draw_grid()
+        self.redraw_selection()
+
+    def center_drawing(self) -> None:
+        """Put the middle of the drawing in the middle of the viewport."""
+        boxes = [record.box for record in self.shapes.values()]
+        if not boxes:
+            self.pan_to(0.0, 0.0)
+            self.set_status("Nothing drawn yet. View reset to the origin.")
+            return
+
+        left = min(box[0] for box in boxes)
+        top = min(box[1] for box in boxes)
+        right = max(box[2] for box in boxes)
+        bottom = max(box[3] for box in boxes)
+        width = self.length_to_model(max(self.canvas.winfo_width(), 1))
+        height = self.length_to_model(max(self.canvas.winfo_height(), 1))
+        self.pan_to((left + right) / 2 - width / 2, (top + bottom) / 2 - height / 2)
+        self.set_status(f"Centred {len(self.shapes)} shape(s) in the view.")
+
     def on_press(self, event: tk.Event) -> None:
+        self.canvas.focus_set()  # so the space key reaches the canvas
         x, y = self.pointer(event)
         shift = bool(self.modifiers(event) & 0x0001)
+
+        if self.space_held:  # space + drag moves the view, never the shapes
+            self.start_pan(event)
+            return
 
         handle = self.handle_at(x, y) if self.selection else None
         if handle is not None:
@@ -1202,6 +1428,14 @@ class DoodleMyShapes:
         return math.ceil(min_w / cell) * cell, math.ceil(min_h / cell) * cell
 
     def on_drag(self, event: tk.Event) -> None:
+        if self.drag_mode == "pan":
+            scale = self.display_scale or 1.0
+            dx = self.canvas.canvasx(event.x) - self.pan_from[0]
+            dy = self.canvas.canvasy(event.y) - self.pan_from[1]
+            self.pan_to(self.pan_origin[0] - dx / scale, self.pan_origin[1] - dy / scale)
+            self.set_status(f"View at {self.model_to_cm(self.pan_x):.1f}, {self.model_to_cm(self.pan_y):.1f} cm")
+            return
+
         if self.drag_mode is None or not self.selection:
             return
 
@@ -1279,6 +1513,9 @@ class DoodleMyShapes:
         return x1, y1, x2, y2
 
     def on_release(self, _event: tk.Event) -> None:
+        if self.drag_mode == "pan":  # the viewport is not part of the document
+            self.end_pan()
+            return
         if self.drag_mode is not None and self.selection:
             if self.selected is not None:
                 self.report_size(self.selected)
@@ -1292,7 +1529,7 @@ class DoodleMyShapes:
         return event.state if isinstance(event.state, int) else 0
 
     def on_hover(self, event: tk.Event) -> None:
-        if self.drag_mode is not None:
+        if self.drag_mode is not None or self.space_held:
             return
         x, y = self.pointer(event)
         handle = self.handle_at(x, y) if self.selection else None
@@ -1337,7 +1574,7 @@ class DoodleMyShapes:
             self.set_status("Delete cancelled.")
             return
 
-        self.pane_item = None  # their records are going; nothing to commit back to
+        self.pane_target = None  # their records are going; nothing to commit back to
         for identifier in targets:
             self.forget(identifier)
             self.shapes.pop(identifier, None)
@@ -1347,6 +1584,7 @@ class DoodleMyShapes:
         self.canvas.delete(TAG_HANDLE)
         self.canvas.delete(TAG_MARK)
         self.show_in_pane(None)
+        self.prune_groups()  # a group with no members left is gone too
         self.renumber()  # close the gaps the deleted layers left
         self.restack()
         self.autosave(f"deletion of {described}")
@@ -1358,9 +1596,10 @@ class DoodleMyShapes:
             self.set_status("Clear cancelled.")
             return
         self.shapes.clear()
+        self.groups.clear()
         self.selection = []
         self.selected = None
-        self.pane_item = None
+        self.pane_target = None
         self.show_in_pane(None)
         self.redraw_all()
         self.autosave("clearing the canvas")
@@ -1370,7 +1609,8 @@ class DoodleMyShapes:
         self.set_status(
             "Right-click empty canvas to add a shape, right-click a shape to recolor it. "
             "Shift-click to select several. Drag to move, drag a handle to resize; everything "
-            f"snaps to the grid. Ctrl+Z undoes. State lives in {self.state_file}."
+            "snaps to the grid. Hold space and drag to move the view, Ctrl+0 to centre the drawing. "
+            f"Ctrl+Z undoes. State lives in {self.state_file}."
         )
 
     # ----------------------------------------------------------------- export
@@ -1475,6 +1715,28 @@ class DoodleMyShapes:
             placed.append((record, (x1 - box[0], y1 - box[1], x2 - box[0], y2 - box[1])))
         return placed
 
+    def export_group_labels(self, box: Box) -> list[tuple[str, str, tuple[float, float], float]]:
+        """Visible group names as (text, ink, centre, wrap width), in the picture's own frame."""
+        labels = []
+        members_by_group = self.group_index()
+        for identifier, group in self.groups.items():
+            members = members_by_group.get(identifier, [])
+            if not group.name or not group.show_name or not members:
+                continue
+            frame = self.group_box(identifier)
+            if frame is None:
+                continue
+            x1, y1, x2, y2 = frame
+            labels.append(
+                (
+                    group.name,
+                    ink_for(self.shapes[members[-1]].fill),
+                    ((x1 + x2) / 2 - box[0], (y1 + y2) / 2 - box[1]),
+                    x2 - x1,
+                )
+            )
+        return labels
+
     def as_svg(self, box: Box) -> str:
         width, height = box[2] - box[0], box[3] - box[1]
         parts = [
@@ -1492,13 +1754,19 @@ class DoodleMyShapes:
                     f'<ellipse cx="{x1 + shape_w / 2:.2f}" cy="{y1 + shape_h / 2:.2f}" '
                     f'rx="{shape_w / 2:.2f}" ry="{shape_h / 2:.2f}" {common}/>'
                 )
-            if record.name:
+            if record.name and record.show_name:
                 parts.append(
                     f'<text x="{x1 + shape_w / 2:.2f}" y="{y1 + shape_h / 2:.2f}" '
                     f'text-anchor="middle" dominant-baseline="central" '
                     f'font-family="sans-serif" font-size="{EXPORT_FONT_SIZE}" '
                     f'fill="{ink_for(record.fill)}">{escape(record.name)}</text>'
                 )
+
+        for text, ink, (cx, cy), _width in self.export_group_labels(box):
+            parts.append(
+                f'<text x="{cx:.2f}" y="{cy:.2f}" text-anchor="middle" dominant-baseline="central" '
+                f'font-family="sans-serif" font-size="{EXPORT_FONT_SIZE}" fill="{ink}">{escape(text)}</text>'
+            )
         parts.append("</svg>")
         return "\n".join(parts) + "\n"
 
@@ -1526,7 +1794,7 @@ class DoodleMyShapes:
                 draw.rectangle(corners, fill=record.fill, outline=SHAPE_OUTLINE, width=1)
             else:
                 draw.ellipse(corners, fill=record.fill, outline=SHAPE_OUTLINE, width=1)
-            if record.name:
+            if record.name and record.show_name:
                 draw.text(
                     ((corners[0] + corners[2]) / 2, (corners[1] + corners[3]) / 2),
                     record.name,
@@ -1534,6 +1802,9 @@ class DoodleMyShapes:
                     font=font,
                     anchor="mm",
                 )
+
+        for text, ink, centre, _width in self.export_group_labels(box):
+            draw.text(centre, text, fill=ink, font=font, anchor="mm")
 
         image.save(path, "JPEG", quality=92) if suffix in (".jpg", ".jpeg") else image.save(path, "PNG")
 
@@ -1551,10 +1822,14 @@ class DoodleMyShapes:
                 "grid_color": self.grid_color.get(),
                 "grid_line": self.grid_line.get(),
             },
-            "settings": {"confirm_deletes": self.confirm_deletes.get()},
+            "settings": {
+                "confirm_deletes": self.confirm_deletes.get(),
+                "color_groups": self.color_groups.get(),
+            },
             "groups": [
-                {"uuid": group, "members": [self.shapes[member].uuid for member in members]}
+                self.groups[group].to_json([self.shapes[member].uuid for member in members])
                 for group, members in self.group_index().items()
+                if group in self.groups
             ],
             "shapes": [self.shapes[identifier].to_json() for identifier in self.by_depth()],
         }
@@ -1712,15 +1987,19 @@ class DoodleMyShapes:
         self.suspend_autosave = True
         try:
             self.shapes.clear()
+            self.groups.clear()
             self.selection = []
             self.selected = None
-            self.pane_item = None
+            self.pane_target = None
             self.show_in_pane(None)
             self.read_canvas_settings(raw.get("canvas"))
 
             settings = raw.get("settings")
-            if isinstance(settings, dict) and "confirm_deletes" in settings:
-                self.confirm_deletes.set(bool(settings["confirm_deletes"]))
+            if isinstance(settings, dict):
+                if "confirm_deletes" in settings:
+                    self.confirm_deletes.set(bool(settings["confirm_deletes"]))
+                if "color_groups" in settings:
+                    self.color_groups.set(bool(settings["color_groups"]))
 
             floor = self.min_extent
             for position, entry in enumerate(raw.get("shapes", [])):
@@ -1752,19 +2031,31 @@ class DoodleMyShapes:
 
     def apply_groups(self, groups: object) -> None:
         """Honour the file's `groups` list, which is the authoritative membership record."""
-        if not isinstance(groups, list):
-            return
-        for entry in groups:
-            if not isinstance(entry, dict):
-                continue
-            identifier = str(entry.get("uuid") or "")
-            members = entry.get("members")
-            if not identifier or not isinstance(members, list):
-                continue
-            for member in members:
-                record = self.shapes.get(str(member))
-                if record is not None:
-                    record.group = identifier
+        self.groups.clear()
+        if isinstance(groups, list):
+            for entry in groups:
+                if not isinstance(entry, dict):
+                    continue
+                identifier = str(entry.get("uuid") or "")
+                members = entry.get("members")
+                if not identifier or not isinstance(members, list):
+                    continue
+                self.groups[identifier] = GroupRecord(
+                    uuid=identifier,
+                    name=str(entry.get("name") or ""),
+                    description=str(entry.get("description") or ""),
+                    show_name=bool(entry.get("show_name", False)),
+                )
+                for member in members:
+                    record = self.shapes.get(str(member))
+                    if record is not None:
+                        record.group = identifier
+
+        # A shape may name a group the list forgot; keep the membership and give it a bare record.
+        for record in self.shapes.values():
+            if record.group and record.group not in self.groups:
+                self.groups[record.group] = GroupRecord(uuid=record.group)
+        self.prune_groups()
 
     def warn(self, title: str, message: str) -> None:
         messagebox.showwarning(title, message, parent=self.root)

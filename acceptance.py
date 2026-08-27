@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HOME = tempfile.mkdtemp()
@@ -114,7 +115,7 @@ a.group_selection()
 a.select(one)  # selecting a member selects the group
 before = {k: a.shapes[k].box for k in (one, two)}
 a.begin_drag("move", *a.shapes[one].center)
-a.on_drag(press(a.to_screen(a.shapes[one].center[0] + 150), a.to_screen(a.shapes[one].center[1] + 90)))
+a.on_drag(press(*a.point_to_screen(a.shapes[one].center[0] + 150, a.shapes[one].center[1] + 90)))
 a.on_release(tk.Event())
 deltas = [tuple(round(n - o, 6) for n, o in zip(a.shapes[k].box, before[k])) for k in (one, two)]
 check(7, "dragging a group moves every member by one delta", len(a.selection) == 2 and deltas[0] == deltas[1], str(deltas))
@@ -123,7 +124,7 @@ before = {k: a.shapes[k].box for k in (one, two)}
 frame = a.selection_box()
 a.begin_drag("resize", frame[2], frame[3])
 a.drag_handle = "se"
-a.on_drag(press(a.to_screen(frame[2] + 200), a.to_screen(frame[3] + 120)))
+a.on_drag(press(*a.point_to_screen(frame[2] + 200, frame[3] + 120)))
 a.on_release(tk.Event())
 grew = all(a.shapes[k].width > before[k][2] - before[k][0] for k in (one, two))
 gap_before = before[two][0] - before[one][0]
@@ -144,7 +145,7 @@ steps.append(("add", before_add))
 a.select(extra)
 before_move = snapshot()
 a.begin_drag("move", *a.shapes[extra].center)
-a.on_drag(press(a.to_screen(a.shapes[extra].center[0] + 100), a.to_screen(a.shapes[extra].center[1])))
+a.on_drag(press(*a.point_to_screen(a.shapes[extra].center[0] + 100, a.shapes[extra].center[1])))
 a.on_release(tk.Event())
 steps.append(("move", before_move))
 
@@ -152,7 +153,7 @@ before_resize = snapshot()
 box = a.shapes[extra].box
 a.begin_drag("resize", box[2], box[3])
 a.drag_handle = "se"
-a.on_drag(press(a.to_screen(box[2] + 80), a.to_screen(box[3] + 80)))
+a.on_drag(press(*a.point_to_screen(box[2] + 80, box[3] + 80)))
 a.on_release(tk.Event())
 steps.append(("resize", before_resize))
 
@@ -255,6 +256,9 @@ a.on_confirm_setting_changed()
 check(16, "declining a delete changes nothing; the preference survives a restart", ok16)
 
 # ----------------------------------------------------------------------- 17
+for identifier in list(a.shapes):  # this check is about shapes, so start ungrouped
+    a.shapes[identifier].group = ""
+a.prune_groups()
 first_id = a.by_depth()[0]
 second_id = a.by_depth()[-1]
 a.select(first_id)
@@ -289,7 +293,7 @@ for pitch in (0.1, 0.25, 0.5, 1.0, 2.0, 5.0):
     box = a.shapes[lone].box
     a.begin_drag("resize", box[2], box[3])
     a.drag_handle = "se"
-    a.on_drag(press(a.to_screen(box[0] - 900), a.to_screen(box[1] - 900)))
+    a.on_drag(press(*a.point_to_screen(box[0] - 900, box[1] - 900)))
     a.on_release(tk.Event())
     record = a.shapes[lone]
     if not (
@@ -309,7 +313,7 @@ for pitch in (0.1, 0.25, 0.5, 1.0, 2.0, 5.0):
     frame = a.selection_box()
     a.begin_drag("resize", frame[2], frame[3])
     a.drag_handle = "se"
-    a.on_drag(press(a.to_screen(frame[0] - 900), a.to_screen(frame[1] - 900)))
+    a.on_drag(press(*a.point_to_screen(frame[0] - 900, frame[1] - 900)))
     a.on_release(tk.Event())
     new_frame = a.selection_box()
 
@@ -443,6 +447,364 @@ check(
     result.returncode != 0 and "not a directory" in result.stderr.lower(),
     f"rc={result.returncode} err={result.stderr.strip()[:120]}",
 )
+
+# ------------------------------------------------------------------ 23, 24, 25
+root = tk.Tk()
+g = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".groups")
+root.update()
+left = g.add_shape("rectangle", 200, 200)
+right = g.add_shape("circle", 500, 300)
+loose = g.add_shape("rectangle", 900, 500)
+g.select(left)
+g.select(right, add=True)
+g.group_selection()
+gid = next(iter(g.groups))
+
+# 23: the pane edits the group, not its members
+ok23 = g.pane_target == ("group", gid)
+g.pane_name.insert(0, "Bracket assembly")
+g.pane_description.insert("1.0", "Two parts, welded.")
+g.commit_pane()
+ok23 = ok23 and g.groups[gid].name == "Bracket assembly"
+ok23 = ok23 and g.shapes[left].name == "" and g.shapes[right].name == ""
+
+g.select(None)
+g.select(right)  # any member shows the same group
+ok23 = ok23 and g.pane_target == ("group", gid) and g.pane_name.get() == "Bracket assembly"
+g.select(loose)  # an ungrouped shape shows itself
+ok23 = ok23 and g.pane_target == ("shape", loose)
+
+document = json.loads((Path(HOME) / ".groups/state.json").read_text())
+entry = document["groups"][0]
+ok23 = ok23 and entry["name"] == "Bracket assembly" and entry["description"] == "Two parts, welded."
+ok23 = ok23 and sorted(entry["members"]) == sorted([left, right])
+
+saved = Path(HOME) / "groups.json"
+g.write_state(saved)
+before_undo = json.dumps(g.to_state(), sort_keys=True)
+g.select(right)
+g.pane_name.delete(0, tk.END)
+g.pane_name.insert(0, "Renamed")
+g.commit_pane()
+g.undo()
+ok23 = ok23 and json.dumps(g.to_state(), sort_keys=True) == before_undo
+
+g.clear_canvas()
+g.load_state(saved, announce=False)
+reloaded = next(iter(g.groups.values()))
+ok23 = ok23 and reloaded.name == "Bracket assembly" and reloaded.description == "Two parts, welded."
+check(23, "groups carry their own name and description, shown and edited in the pane", ok23)
+
+# 24: colouring a whole group is opt-in
+members = [k for k in g.shapes if g.shapes[k].group]
+solo = [k for k in g.shapes if not g.shapes[k].group]
+g.select(members[0])
+ok24 = g.color_groups.get() is False  # default
+g.set_fill("#e2726e")
+coloured = [k for k in members if g.shapes[k].fill == "#e2726e"]
+ok24 = ok24 and coloured == [members[0]] and len(g.selection) == len(members)
+
+g.color_groups.set(True)
+g.on_color_groups_changed()
+g.select(members[0])
+g.set_fill("#7bb661")
+ok24 = ok24 and all(g.shapes[k].fill == "#7bb661" for k in members)
+
+# an ad-hoc multiple selection is not a group and is always coloured together
+g.color_groups.set(False)
+g.on_color_groups_changed()
+if len(solo) >= 1:
+    extra_shape = g.add_shape("circle", 1200, 600)
+    g.select(solo[0])
+    g.select(extra_shape, add=True)
+    g.set_fill("#e8b04b")
+    ok24 = ok24 and g.shapes[solo[0]].fill == "#e8b04b" and g.shapes[extra_shape].fill == "#e8b04b"
+
+persisted = json.loads((Path(HOME) / ".groups/state.json").read_text())["settings"]["color_groups"]
+root.destroy()
+root = tk.Tk()
+g2 = DoodleMyShapes(root, state_dir=Path(HOME) / ".groups")
+root.update()
+ok24 = ok24 and persisted is False and g2.color_groups.get() is False
+check(24, "group colouring is off by default, can be enabled, and persists", ok24)
+
+# 25: no orphan group records
+grouped = [k for k in g2.shapes if g2.shapes[k].group]
+g2.select(grouped[0])
+g2.ungroup_selection()
+ok25 = g2.groups == {} and json.loads((Path(HOME) / ".groups/state.json").read_text())["groups"] == []
+
+again = [g2.add_shape("rectangle", 300, 700), g2.add_shape("circle", 400, 700)]
+g2.select(again[0])
+g2.select(again[1], add=True)
+g2.group_selection()
+ok25 = ok25 and len(g2.groups) == 1
+g2.delete_selected()
+ok25 = ok25 and g2.groups == {} and g2.pane_target is None
+check(25, "groups with no members are pruned from the model and the document", ok25)
+root.destroy()
+
+# ---------------------------------------------------------------- 26, 27, 28
+root = tk.Tk()
+v = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".visible")
+root.update()
+labels = lambda: sorted(v.canvas.itemcget(i, "text") for i in v.canvas.find_withtag("label"))
+group_labels = lambda: sorted(v.canvas.itemcget(i, "text") for i in v.canvas.find_withtag("group-label"))
+
+# 26: the popup no longer offers Properties
+entries = []
+for index in range(v.shape_popup.index("end") + 1):
+    try:
+        entries.append(v.shape_popup.entrycget(index, "label"))
+    except tk.TclError:
+        pass
+ok26 = not any("propert" in entry.lower() for entry in entries) and not hasattr(v, "open_properties")
+check(26, "the shape popup no longer carries a Properties entry", ok26, str(entries))
+
+# 27: a shape shows its name by default and the toggle hides it
+one = v.add_shape("rectangle", 200, 200)
+v.select(one)
+ok27 = str(v.show_button.cget("state")) == "disabled"  # nothing to show yet
+v.pane_name.insert(0, "Plate")
+v.commit_pane()
+ok27 = ok27 and v.pane_show_text.get() == "Show" and str(v.show_button.cget("state")) == "normal"
+ok27 = ok27 and labels() == ["Plate"] and v.shapes[one].show_name is True
+
+v.pane_show.set(False)
+v.on_show_toggled()
+ok27 = ok27 and v.pane_show_text.get() == "Hide" and labels() == [] and v.shapes[one].show_name is False
+
+v.pane_show.set(True)
+v.on_show_toggled()
+ok27 = ok27 and v.pane_show_text.get() == "Show" and labels() == ["Plate"]
+
+# it survives save/load and undo
+saved = Path(HOME) / "visible.json"
+v.pane_show.set(False)
+v.on_show_toggled()
+v.write_state(saved)
+v.clear_canvas()
+v.load_state(saved, announce=False)
+reloaded = next(iter(v.shapes.values()))
+ok27 = ok27 and reloaded.show_name is False and labels() == []
+v.undo()
+check(27, "shape names show by default; the toggle hides them and persists", ok27)
+
+# 28: a group's name is hidden by default and appears centred on the group
+v.clear_canvas()
+left = v.add_shape("rectangle", 200, 300)
+right = v.add_shape("circle", 700, 300)
+v.select(left)
+v.select(right, add=True)
+v.group_selection()
+gid = next(iter(v.groups))
+v.pane_name.insert(0, "Assembly")
+v.commit_pane()
+ok28 = v.groups[gid].show_name is False and v.pane_show_text.get() == "Hide" and group_labels() == []
+
+v.pane_show.set(True)
+v.on_show_toggled()
+ok28 = ok28 and v.pane_show_text.get() == "Show" and group_labels() == ["Assembly"]
+
+frame = v.group_box(gid)
+expected = v.point_to_screen((frame[0] + frame[2]) / 2, (frame[1] + frame[3]) / 2)
+actual = v.canvas.coords(v.group_labels[gid])
+ok28 = ok28 and all(abs(a - b) < 0.01 for a, b in zip(actual, expected))
+
+# it follows the group when the group moves
+v.select(left)
+v.begin_drag("move", *v.shapes[left].center)
+v.on_drag(press(*v.point_to_screen(v.shapes[left].center[0] + 120, v.shapes[left].center[1] + 80)))
+v.on_release(tk.Event())
+frame = v.group_box(gid)
+expected = v.point_to_screen((frame[0] + frame[2]) / 2, (frame[1] + frame[3]) / 2)
+ok28 = ok28 and all(abs(a - b) < 0.01 for a, b in zip(v.canvas.coords(v.group_labels[gid]), expected))
+
+# the group label sits above every member
+order = v.canvas.find_all()
+ok28 = ok28 and all(order.index(v.group_labels[gid]) > order.index(v.items[m]) for m in (left, right))
+
+# hidden names do not reach the export; shown ones do
+v.export_to(Path(HOME) / "shown.svg")
+shown_svg = (Path(HOME) / "shown.svg").read_text()
+v.pane_show.set(False)
+v.on_show_toggled()
+v.export_to(Path(HOME) / "hidden.svg")
+hidden_svg = (Path(HOME) / "hidden.svg").read_text()
+ok28 = ok28 and ">Assembly<" in shown_svg and ">Assembly<" not in hidden_svg
+
+# ungrouping takes the label away with the group
+v.select(left)
+v.ungroup_selection()
+ok28 = ok28 and group_labels() == [] and v.group_labels == {}
+check(28, "group names are hidden by default, centre on the group, and follow it", ok28)
+root.destroy()
+
+# ---------------------------------------------------------------- 29, 30, 31
+root = tk.Tk()
+v = DoodleMyShapes(root, clean=True, state_dir=Path(HOME) / ".view")
+root.update()
+root.update_idletasks()
+
+one = v.add_shape("rectangle", 300, 200)
+v.select(one)
+v.pane_name.insert(0, "Anchor")
+v.commit_pane()
+model_before = v.shapes[one].box
+screen_before = v.canvas.coords(v.items[one])
+doc_before = json.dumps(v.to_state(), sort_keys=True)
+history_before = len(v.history)
+
+# 29: space + drag moves the view, not the shapes
+v.on_space_down(tk.Event())
+ok29 = v.space_held is True
+start = v.point_to_screen(*v.shapes[one].center)
+v.on_press(press(*start))
+ok29 = ok29 and v.drag_mode == "pan"
+v.on_drag(press(start[0] - 200, start[1] - 120))
+v.on_release(tk.Event())
+
+model_after = v.shapes[one].box
+screen_after = v.canvas.coords(v.items[one])
+ok29 = ok29 and model_after == model_before  # the model never moved
+ok29 = ok29 and [round(n - o) for n, o in zip(screen_after, screen_before)] == [-200, -120, -200, -120]
+ok29 = ok29 and json.dumps(v.to_state(), sort_keys=True) == doc_before
+ok29 = ok29 and len(v.history) == history_before  # panning is not undoable
+
+# the label and the handles came along
+label_at = v.canvas.coords(v.labels[one])
+expect_label = v.point_to_screen(*v.shapes[one].center)
+ok29 = ok29 and all(abs(a - b) < 0.01 for a, b in zip(label_at, expect_label))
+
+# clicks still land on the right shape after panning
+hit = v.shape_at(*v.point_to_model(*v.point_to_screen(*v.shapes[one].center)))
+ok29 = ok29 and hit == one
+
+# an X11 auto-repeat burst mid-drag must not stop the pan
+v.on_space_down(tk.Event())
+resume = v.point_to_screen(*v.shapes[one].center)
+v.on_press(press(*resume))
+marks = []
+for step in (40, 80, 120, 160):
+    if step in (80, 160):  # auto-repeat sends release/press pairs while the key is held
+        v.on_space_up(tk.Event())
+        root.update()
+        v.on_space_down(tk.Event())
+    v.on_drag(press(resume[0] - step, resume[1]))
+    marks.append(round(v.pan_x, 1))
+ok29 = ok29 and len(set(marks)) == 4 and v.drag_mode == "pan"
+
+# releasing space mid-drag lets the pan finish
+v.on_space_up(tk.Event())
+root.update()
+time.sleep(0.15)
+root.update()
+ok29 = ok29 and v.space_held is False and v.drag_mode == "pan"
+v.on_drag(press(resume[0] - 400, resume[1]))
+ok29 = ok29 and round(v.pan_x, 1) != marks[-1]
+v.on_release(tk.Event())
+ok29 = ok29 and v.drag_mode is None
+
+# space inside a text field types a space instead of arming the pan
+v.select(one)
+v.pane_name.focus_set()
+root.update()
+v.on_space_down(tk.Event())
+ok29 = ok29 and v.typing() is True and v.space_held is False
+v.canvas.focus_set()
+root.update()
+check(29, "space + drag pans, survives auto-repeat, and stays out of text fields", ok29)
+
+# 30: negative model coordinates are legal and survive a round trip
+v.pan_to(0.0, 0.0)
+v.select(one)
+v.begin_drag("move", *v.shapes[one].center)
+v.on_drag(press(*v.point_to_screen(v.shapes[one].center[0] - 600, v.shapes[one].center[1] - 400)))
+v.on_release(tk.Event())
+negative = v.shapes[one]
+stored = [round(value, 2) for value in (negative.x, negative.y, negative.width, negative.height)]
+ok30 = negative.x < 0 and negative.y < 0
+
+saved = Path(HOME) / "negative.json"
+v.write_state(saved)
+v.clear_canvas()
+v.load_state(saved, announce=False)
+back = next(iter(v.shapes.values()))
+# position and size are each rounded to 2dp on write, so compare those, not the derived far edge
+ok30 = ok30 and [round(value, 2) for value in (back.x, back.y, back.width, back.height)] == stored
+
+# the grid still covers the visible area when the origin is off screen
+v.pan_to(-900.0, -700.0)
+ok30 = ok30 and len(v.canvas.find_withtag("grid")) > 0
+
+# and export is unaffected by where the view happens to be
+v.pan_to(0.0, 0.0)
+v.export_to(Path(HOME) / "v1.png")
+v.pan_to(-2500.0, 1800.0)
+v.export_to(Path(HOME) / "v2.png")
+ok30 = ok30 and (Path(HOME) / "v1.png").read_bytes() == (Path(HOME) / "v2.png").read_bytes()
+check(30, "negative coordinates round-trip; grid and export ignore the viewport", ok30)
+
+# 31: centring, and right click only
+v.clear_canvas()
+first = v.add_shape("rectangle", 200, 200)
+second = v.add_shape("circle", 1400, 900)
+v.pan_to(9000.0, -4000.0)
+v.center_drawing()
+boxes = [r.box for r in v.shapes.values()]
+mid = ((min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2,
+       (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2)
+centre_screen = v.point_to_screen(*mid)
+viewport_middle = (v.canvas.winfo_width() / 2, v.canvas.winfo_height() / 2)
+ok31 = all(abs(a - b) < 1.0 for a, b in zip(centre_screen, viewport_middle))
+
+v.clear_canvas()
+v.pan_to(500.0, 500.0)
+v.center_drawing()
+ok31 = ok31 and (v.pan_x, v.pan_y) == (0.0, 0.0)  # nothing drawn -> back to the origin
+
+# no view gesture may touch the document, the state file or the undo history
+state_path = Path(HOME) / ".view/state.json"
+v.add_shape("rectangle", 400, 400)
+quiet = (len(v.history), state_path.read_bytes(), json.dumps(v.to_state(), sort_keys=True))
+v.on_space_down(tk.Event())
+v.on_press(press(600, 400))
+v.on_drag(press(420, 300))
+v.on_release(tk.Event())
+v.on_space_up(tk.Event())
+root.update()
+v.on_middle_press(press(500, 500))
+v.on_drag(press(250, 350))
+v.on_middle_release(tk.Event())
+v.center_drawing()
+ok31 = ok31 and (v.pan_x, v.pan_y) != (0.0, 0.0)  # the view really did move
+ok31 = ok31 and (len(v.history), state_path.read_bytes(), json.dumps(v.to_state(), sort_keys=True)) == quiet
+ok31 = ok31 and json.loads(v.json_text.get("1.0", "end-1c")) == v.to_state()
+
+entries = []
+for index in range(v.canvas_popup.index("end") + 1):
+    try:
+        entries.append(v.canvas_popup.entrycget(index, "label"))
+    except tk.TclError:
+        pass
+ok31 = ok31 and "Center drawing" in entries
+
+# the popup is on the right button; the middle button pans instead of posting a menu
+posted = []
+v._post = lambda menu, event: posted.append(menu)
+v.on_popup(press(30, 30))
+ok31 = ok31 and posted == [v.canvas_popup] and bool(v.canvas.bind("<Button-3>"))
+
+pan_before = (v.pan_x, v.pan_y)
+model_before = {k: v.shapes[k].box for k in v.shapes}
+v.on_middle_press(press(500, 400))
+v.on_drag(press(300, 250))
+moved = (v.pan_x, v.pan_y) != pan_before
+v.on_middle_release(tk.Event())
+ok31 = ok31 and moved and v.drag_mode is None and {k: v.shapes[k].box for k in v.shapes} == model_before
+ok31 = ok31 and not posted[1:]  # no menu appeared from the middle button
+check(31, "view gestures record nothing; right button posts the menu, middle button pans", ok31, str(entries))
+root.destroy()
 
 print(f"\n{len(PASS)}/{len(PASS) + len(FAIL)} checks passed")
 if FAIL:

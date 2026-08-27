@@ -41,13 +41,20 @@ MODEL_PX_PER_CM = 37.795275590551181      # 96 dpi reference, same as CSS
 - Model units are the export unit too: the same drawing exports to the same pixel dimensions
   everywhere.
 
-**The display's real DPI is used only to render.**
+**The display's real DPI, and the viewport, are used only to render.**
 
 ```
 display_scale = actual_pixels_per_cm / MODEL_PX_PER_CM     # 1.0 when DPI is unknown
-screen_x      = model_x * display_scale
-model_x       = screen_x / display_scale
+screen_x      = (model_x - pan_x) * display_scale
+model_x       = screen_x / display_scale + pan_x
 ```
+
+Distances and points transform differently: a length is scaled but not offset. Keep the two
+conversions separate (`length_to_screen` and `point_to_screen`) so a wrap width or a handle radius
+cannot accidentally pick up the pan.
+
+Model coordinates may be negative. Nothing depends on an origin at zero: bounding boxes use
+min/max, snapping rounds, and export normalises to the content box.
 
 - Convert pointer coordinates to model units on the way in; convert to screen units on the way out.
 - All arithmetic — snapping, hit testing, bounding boxes, minimum sizes — happens in model units.
@@ -141,6 +148,7 @@ Edit
   Undo                       Ctrl+Z
   ---
   [x] Confirm before deleting
+  [ ] Allow coloring a whole group
 Shape
   Add rectangle
   Add circle
@@ -157,6 +165,8 @@ View
     Line type >              Solid | Stippled | Dotted | Dashed | Dash-dot   (radio)
     Grid size >              0.5 cm | 1 cm | 2 cm | 5 cm | --- | Custom size...  (radio + command)
   ---
+  Center drawing            Ctrl+0
+  ---
   Canvas tab
   Json tab
 Help
@@ -166,11 +176,15 @@ Help
 Additional keys: `Escape` deselects, `Backspace` deletes, `Ctrl+Up` / `Ctrl+Down` move the selected
 shape one layer, `Ctrl+Shift+Up` / `Ctrl+Shift+Down` send it to top / bottom.
 
-**Canvas popup** (right click on empty canvas): `Rectangle`, `Circle`.
+**Canvas popup** (right click on empty canvas): `Rectangle`, `Circle`, separator,
+`Center drawing`.
+
+Popups are on the **right button only**. The middle button pans (§10a).
 
 **Shape popup** (right click on a shape): `Color >` (the palette), `Depth >` (Bring to top, Move up
-one, Move down one, Send to bottom), separator, `Group selection`, `Ungroup`, separator,
-`Properties...`.
+one, Move down one, Send to bottom), separator, `Group selection`, `Ungroup`.
+
+There is no Properties entry: names and descriptions are edited in the pane (§18).
 
 Releasing the right button without highlighting an entry dismisses the popup.
 
@@ -194,6 +208,19 @@ a source of truth.
 | `description` | string | may be empty |
 | `depth` | integer | 0 is bottom; higher is nearer the front |
 | `group` | string | group uuid, empty when ungrouped |
+| `show_name` | bool | whether the name is drawn on the canvas; default true |
+
+**Group record**
+
+| Field | Type | Notes |
+|---|---|---|
+| `uuid` | string | UUID4, assigned when the group is created |
+| `name` | string | may be empty |
+| `description` | string | may be empty |
+| `show_name` | bool | whether the group name is drawn; default **false** |
+
+Members are not stored on the group at runtime; they are the shapes whose `group` matches. The
+document writes them out explicitly so the membership is readable and authoritative on load.
 
 **Invariants**
 
@@ -204,6 +231,8 @@ a source of truth.
 - `width` and `height` are at least `min_extent` (§12) — including every member of a group after
   the group has been resized.
 - Every uuid in a group's `members` list refers to an existing shape.
+- Every group record has at least one member; empty groups are pruned.
+- Every non-empty `group` field on a shape names an existing group record.
 
 Interactions compute new field values on the model and then redraw. Serialisation reads the model.
 The model must be fully usable with no display attached: creating shapes, snapping, grouping, depth
@@ -224,9 +253,15 @@ ordering, undo and serialisation all work headlessly.
     "grid_color": "#cfe0f5",
     "grid_line": "Stippled"
   },
-  "settings": { "confirm_deletes": true },
+  "settings": { "confirm_deletes": true, "color_groups": false },
   "groups": [
-    { "uuid": "…", "members": ["shape-uuid", "shape-uuid"] }
+    {
+      "uuid": "…",
+      "name": "Bracket assembly",
+      "description": "Two parts, welded.",
+      "show_name": false,
+      "members": ["shape-uuid", "shape-uuid"]
+    }
   ],
   "shapes": [
     {
@@ -237,6 +272,7 @@ ordering, undo and serialisation all work headlessly.
       "fill": "#d3d3d3",
       "depth": 0,
       "group": null,
+      "show_name": true,
       "position": { "x": 264.57, "y": 188.98 },
       "size": { "width": 75.59, "height": 37.80 }
     }
@@ -245,7 +281,9 @@ ordering, undo and serialisation all work headlessly.
 ```
 
 - Position and size are separate objects, not two corner points.
-- Numbers are model units, rounded to two decimals on write.
+- Numbers are model units, rounded to two decimals on write. Position and size are rounded
+  independently, so a reloaded shape's far edge can differ from the original by up to 0.01 model
+  units (about 0.003 mm). Repeated save/load cycles do not accumulate.
 - `groups` is the authoritative membership record on load; each shape's `group` field mirrors it.
 - Shapes are written in depth order.
 
@@ -315,6 +353,45 @@ size in §3.1, filled with the default fill, with a fresh uuid, at the top of th
 
 The shape's top-left corner is snapped to the grid, which puts every edge of a whole-centimetre
 shape on a grid line.
+
+---
+
+## 10a. The viewport
+
+The canvas shows a window onto the model, positioned by `pan_x`, `pan_y` in model units.
+
+- **Hold space and drag with the left button** to move the view. The pointer keeps hold of the
+  model point it grabbed, so the drag is 1:1 with the mouse.
+- **Drag with the middle button** to do the same with no key involved.
+- **Center drawing** — on the View menu at `Ctrl+0` and on the canvas popup — puts the middle of
+  the drawing's bounding box in the middle of the viewport. With nothing drawn it returns to the
+  origin.
+
+**Holding space must be read correctly.** X11 auto-repeat delivers a *release* followed by a press
+for as long as a key is held, so a handler that trusts the first `KeyRelease` disarms the pan a
+fraction of a second after it starts. Treat a release as real only if no repeat press arrives
+within a short grace period (about 60 ms), and cancel the pending release when one does.
+
+Two further rules make the gesture forgiving:
+
+- A pan already under way continues until the mouse button comes up, whatever the key does
+  meanwhile.
+- Space arms panning wherever the keyboard focus happens to be, *except* inside a text field, where
+  it types a space as normal.
+
+Panning and centring move the window, never the shapes. They therefore:
+
+- do not change the model, the state file or the Json tab;
+- record no undo step, so a pan can never displace a real edit from the 50-step history;
+- have no effect on an export.
+
+The viewport is not persisted at all. Two people opening the same file need not agree on where they
+were looking, and reopening a drawing does not restore a stale scroll position.
+
+The grid is drawn across the visible model rectangle rather than from the canvas origin, and is
+skipped entirely rather than drawn when it would exceed `GRID_LINE_LIMIT` lines.
+
+Zoom is not implemented yet; the transform above is written so it can be added as one more term.
 
 ---
 
@@ -394,6 +471,15 @@ Holding **Shift** on a corner handle preserves the frame's aspect ratio.
   separate group-transform code path.
 - Groups are saved and restored.
 
+**A group is a record, not just a label.** It has a uuid, a `name` and a `description` of its own,
+independent of its members' names. Membership lives on the shapes; the group record holds the
+properties.
+
+A group with no members left — after ungrouping, or after its last member is deleted — is removed
+from the model and from the document. Orphan group records never persist.
+
+A group's name is *not* drawn on the canvas; only shape names are (§16).
+
 ---
 
 ## 14. Depth
@@ -406,14 +492,32 @@ the shape is already at the requested end, report that and change nothing.
 
 ## 15. Fill colour
 
-The `Color` submenu applies to **every** selected shape. Changing a fill also recomputes the label
-ink colour (§16).
+The `Color` submenu applies to every selected shape, with one exception: **colouring a whole group
+is opt-in and off by default.**
+
+While it is off, a shape that belongs to a group is recoloured on its own — the one the popup was
+opened over, which is the primary member — and its group mates keep their fills. The status line
+says how many were left alone.
+
+While it is on, every member of the group is recoloured together.
+
+The setting applies to groups only. Shapes that merely happen to be shift-selected together are not
+a group, and are always recoloured as a set.
+
+`Edit > Allow coloring a whole group` toggles it; the preference is part of the saved state.
+
+Changing a fill also recomputes the label ink colour (§16).
 
 ---
 
 ## 16. Labels
 
-A shape with a non-empty `name` displays that name as text centred on it.
+A shape with a non-empty `name` and `show_name` true displays that name as text centred on it.
+
+A **group** with a non-empty `name` and `show_name` true displays its name centred on the bounding
+box of its members, in the same style. It follows the group as members move or resize, sits above
+every member, and disappears when the group is ungrouped or its name is hidden. Its ink colour is
+chosen against the topmost member's fill.
 
 - The text follows the shape while it is moved or resized.
 - It wraps to the shape's width minus 6 model units.
@@ -421,26 +525,38 @@ A shape with a non-empty `name` displays that name as text centred on it.
   `luminance = (0.299·R + 0.587·G + 0.114·B) / 255`; use `#101010` when `luminance > 0.55`,
   otherwise `#ffffff`.
 - Clearing the name removes the text.
-- Clicking on the text selects the shape beneath it; the label is never a click target.
+- Clicking on the text selects the shape beneath it; labels are never click targets.
+- Only names that are set to show are drawn — on the canvas and in an export alike.
 
 ---
 
-## 17. Properties window
+## 17. Properties pane
 
-Opened from the shape popup. Two fields, `Name` and `Description`, plus the shape's uuid shown
-read-only. Modal.
+To the right of the canvas. Shows and edits `Name` and `Description`, plus a read-only line
+identifying what is being edited.
 
-- **Save** stores the values on the shape.
-- **Cancel** discards them. Escape and the window manager's close button behave as Cancel.
-- Return in the Name field saves.
+**What the pane edits depends on the selection:**
 
----
+| Selection | Pane edits | Read-only line |
+|---|---|---|
+| One ungrouped shape | that shape | kind, depth, uuid |
+| Several ungrouped shapes | the primary shape | kind, depth, uuid, "n selected, editing this one" |
+| Any member of a group | **the group** | "Group of n shapes · editing the group", group uuid |
+| Nothing | nothing; fields disabled | "No shape selected" |
 
-## 18. Properties pane
+### Showing the name on the canvas
 
-To the right of the canvas. Shows and edits `Name` and `Description` for the primary selected shape,
-plus a read-only line giving kind, depth, group and uuid, and the count when several shapes are
-selected.
+Beside the fields is a two-state **Show / Hide** button controlling whether the name is drawn on the
+canvas. The button reads the current state: it says `Show` while the name is visible and `Hide`
+while it is not, and pressing it flips both the state and the label.
+
+- A **shape** defaults to `Show` — a name given to a shape appears on it straight away.
+- A **group** defaults to `Hide` — a group name is for organising, and only appears once asked for.
+- The button is disabled until there is a name to show.
+- The setting is per shape and per group, and is part of the saved state (`show_name`).
+
+Since selecting any member selects the whole group (§11), clicking a grouped shape shows the
+group's properties. To edit an individual member's own name and description, ungroup it, edit the member, and group it again.
 
 - With nothing selected, the fields and the Apply button are **not editable**.
 - Edits commit on Apply, on Return in the Name field, and when focus leaves a field.
@@ -454,7 +570,7 @@ selected.
 
 ---
 
-## 19. Grid
+## 18. Grid
 
 A grid of `grid_cm` × `grid_cm`, default 1 cm, drawn from the canvas origin. Shapes always align to
 it; hiding the grid changes only whether the lines are drawn.
@@ -467,7 +583,7 @@ Redraw the grid when the canvas is resized and after any operation that clears t
 
 ---
 
-## 20. Undo
+## 19. Undo
 
 A history of at most 50 steps, undone with the Undo button or `Ctrl+Z`.
 
@@ -483,7 +599,7 @@ makes undo cover every kind of change for free.
 
 ---
 
-## 21. Deleting
+## 20. Deleting
 
 Deleting acts on the entire selection.
 
@@ -495,7 +611,7 @@ nothing and records no undo step. Clearing an already-empty canvas does not prom
 
 ---
 
-## 22. Export
+## 21. Export
 
 `File > Export as picture...` writes `png`, `jpg`/`jpeg` or `svg`.
 
@@ -522,7 +638,7 @@ belonging to the chosen file type, so the two cannot disagree.
 
 ---
 
-## 23. Acceptance checks
+## 22. Acceptance checks
 
 An implementation is correct if all of these hold, verifiable without a human at the screen.
 
@@ -562,5 +678,32 @@ An implementation is correct if all of these hold, verifiable without a human at
     shape unchanged.
 21. A name on a dark fill renders in `#ffffff` and on a light fill in `#101010`; clearing the name
     removes the text entirely, leaving no orphaned label.
-22. The five rows of the extension table in §22 resolve exactly as written, and the refused row
+22. The five rows of the extension table in §21 resolve exactly as written, and the refused row
     writes no file.
+23. Selecting any member of a group shows the group in the pane; edits save to the group and leave
+    member names untouched, survive save/load, and are undoable. An ungrouped shape still shows
+    itself.
+24. With group colouring off, recolouring a grouped shape changes only that shape; with it on, every
+    member changes. An ad-hoc multiple selection is always recoloured together. The preference
+    survives a restart.
+25. Ungrouping, or deleting every member, removes the group record from the model and from the
+    document.
+26. The shape popup offers no Properties entry.
+27. A named shape shows its name by default; the toggle hides and restores it, the button text
+    tracks the state, and the setting survives save/load and undo.
+28. A named group hides its name by default; when shown it is centred on the group's bounding box,
+    follows the group as it moves, sits above every member, and appears in exports only while
+    shown.
+29. Space + drag moves every shape on screen by the same pixel delta while leaving the model, the
+    state file and the undo history untouched; labels and handles follow, and hit testing still
+    resolves to the right shape. A simulated auto-repeat burst (release/press pairs) mid-drag does
+    not interrupt it, releasing space mid-drag lets the pan finish, and space inside a text field
+    does not arm it.
+30. A shape dragged to negative coordinates round-trips through save and load, the grid still
+    covers the view when the origin is off screen, and two exports taken at different pan offsets
+    are byte-identical.
+31. Center drawing puts the middle of the drawing at the middle of the viewport, returns to the
+    origin when nothing is drawn, and appears on both the View menu and the canvas popup. Panning
+    by either gesture, and centring, leave the document, the state file, the Json tab and the undo
+    history byte-for-byte unchanged. The right button posts the menu; the middle button pans and
+    posts nothing.
