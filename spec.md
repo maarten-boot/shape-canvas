@@ -22,12 +22,6 @@ Allow for the shapes to be `resizable` and `movable`.
 ## Shape Menu
 Make a `popup menu for the shape`appear on right click when the mous is over the shape.
 Make a Color entry in the popup for the shapes to change the fill color.
-Make a `Properties` entry in the `popup menu for the shape`.
-When selecting the `Properties` entry show a window with 2 fields: `Name` and `Description`.
-The window can be closed with `Cancel` or `Save`.
-On Cancel forger the data from the window.
-When closing the `Properties` window with `Save` save the `Name` data as property `name` in the json state for the current shape
-and the `Desription` data as property `description`.
 
 ## Remember state
 Make internal json data structure where you remember the shapes, their color and position attributes and its uuid.
@@ -69,10 +63,32 @@ Allow for Top, Bottom as ultimate positions (Tope being above all other shapes, 
 Allow for a shape to be lower (under another but not the lowest) and higher (above another but not the highest).
 Add the depth level to the saved state.
 
+## Grouping
+Allow for multiple shapes to be selected with Shift + Select.
+When multiple shapes have been selected allow them to be grouped.
+Give each group also a uuid and record what shapes are in the group.
+When moving a shape that is part of a group , move the whole group.
+A group can be resized.
+
+## Properties
+Make a `Properties` entry in the `popup menu for the shape`.
+When selecting the `Properties` entry show a window with 2 fields: `Name` and `Description`.
+The window can be closed with `Cancel` or `Save`.
+On Cancel forger the data from the window.
+When closing the `Properties` window with `Save` save the `Name` data as property `name` in the json state for the current shape
+and the `Desription` data as property `description`.
+When a Name property has been set show that Name as a text entry on the shape.
+
 ## Properties Pane
 When a shape is selected,
 show the following properties in a window on the right side of the canvas and make them editable:
 `Name`, `Description`.
 If no shape is selected the Properties pane should not be editable.
 
+## Changes History
 Allow for changes to be recorded in a history and Undone with a Undo button.
+All deletes must be confirmed by default but add a option to delete without confirmation.
+
+## Export
+Add to the main menu under File a entry to export the data as a picture in 'jpg', 'png' or 'svg' format.
+Use the bounding box of all shapes with a margin of 1 cm around.

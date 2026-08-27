@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from typing import Any, Literal
+from xml.sax.saxutils import escape
 
 # Identity written into every state file, and used for the hidden state directory.
 APP_NAME = Path(sys.argv[0]).stem or "shape_canvas"
@@ -33,6 +34,16 @@ STATE_DIR = Path.home() / f".{APP_NAME}"
 STATE_FILE = STATE_DIR / "state.json"
 STATE_SUFFIX = ".json"
 HISTORY_LIMIT = 50  # how many undo steps are kept
+
+EXPORT_MARGIN_CM = 1.0  # blank border around the shapes in an exported picture
+EXPORT_FORMATS = (".png", ".jpg", ".jpeg", ".svg")
+EXPORT_FONT_SIZE = 12
+EXPORT_FONTS = (  # first one that exists wins; Pillow's built-in font is the fallback
+    "DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+)
 
 CANVAS_BG = "#f4f4f4"  # very light gray
 GRID_COLOR = "#cfe0f5"  # very light blue
@@ -77,6 +88,8 @@ FILL_COLORS: tuple[tuple[str, str], ...] = (
 TAG_SHAPE = "shape"
 TAG_HANDLE = "handle"
 TAG_GRID = "grid"
+TAG_LABEL = "label"
+TAG_MARK = "marquee"  # dashed outline drawn round each shape in a multiple selection
 
 HANDLE_CURSORS = {
     "nw": "top_left_corner",
@@ -100,6 +113,7 @@ class ShapeRecord:
     name: str = ""
     description: str = ""
     depth: int = 0  # 0 is the bottom layer; higher numbers sit on top
+    group: str = ""  # uuid of the group this shape belongs to, empty when ungrouped
 
     def to_json(self, box: tuple[float, float, float, float]) -> dict[str, Any]:
         x1, y1, x2, y2 = box
@@ -110,6 +124,7 @@ class ShapeRecord:
             "description": self.description,
             "fill": self.fill,
             "depth": self.depth,
+            "group": self.group or None,
             "position": {"x": round(x1, 2), "y": round(y1, 2)},
             "size": {"width": round(x2 - x1, 2), "height": round(y2 - y1, 2)},
         }
@@ -185,13 +200,16 @@ class ShapeCanvasApp:
         self.root.geometry("1060x680")
         self.root.minsize(720, 420)
 
-        self.selected: int | None = None
+        self.selected: int | None = None  # the shape the pane edits
+        self.selection: list[int] = []  # every shape being dragged, resized or deleted together
+        self.drag_items: dict[int, tuple[float, float, float, float]] = {}  # boxes when the drag began
         self.drag_mode: str | None = None  # "move" or "resize"
         self.drag_handle: str | None = None
         self.drag_start: tuple[float, float] = (0.0, 0.0)
         self.drag_bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self.menu_point: tuple[float, float] = (0.0, 0.0)
         self.shapes: dict[int, ShapeRecord] = {}  # canvas item id -> record
+        self.labels: dict[int, int] = {}  # shape item id -> the text item drawn on it
         self.suspend_autosave = False  # set while loading, so a load is one write not many
         self.suspend_history = False  # set while undoing, so an undo is not itself recorded
         self.history: list[tuple[str, dict[str, Any]]] = []  # (what changed, state before it)
@@ -201,6 +219,7 @@ class ShapeCanvasApp:
         self.grid_line = tk.StringVar(master=root, value=GRID_LINE_DEFAULT)
         self.grid_cm = tk.DoubleVar(master=root, value=GRID_CM)
         self.pane_item: int | None = None  # the shape the properties pane is showing
+        self.confirm_deletes = tk.BooleanVar(master=root, value=True)
 
         self._build_menu_bar()
         self._build_central_frame()
@@ -224,6 +243,8 @@ class ShapeCanvasApp:
         file_menu.add_command(label="Open state...", accelerator="Ctrl+O", command=self.load_state_dialog)
         file_menu.add_command(label="Save state as...", accelerator="Ctrl+S", command=self.save_state_dialog)
         file_menu.add_separator()
+        file_menu.add_command(label="Export as picture...", accelerator="Ctrl+E", command=self.export_dialog)
+        file_menu.add_separator()
         file_menu.add_command(label="Clear canvas", accelerator="Ctrl+N", command=self.clear_canvas)
         file_menu.add_separator()
         file_menu.add_command(label="Quit", accelerator="Ctrl+Q", command=self.on_close)
@@ -231,11 +252,20 @@ class ShapeCanvasApp:
 
         edit_menu = tk.Menu(menu_bar, tearoff=False)
         edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self.undo)
+        edit_menu.add_separator()
+        edit_menu.add_checkbutton(
+            label="Confirm before deleting",
+            variable=self.confirm_deletes,
+            command=self.on_confirm_setting_changed,
+        )
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
 
         shape_menu = tk.Menu(menu_bar, tearoff=False)
         shape_menu.add_command(label="Add rectangle", command=lambda: self.add_shape_at_center("rectangle"))
         shape_menu.add_command(label="Add circle", command=lambda: self.add_shape_at_center("circle"))
+        shape_menu.add_separator()
+        shape_menu.add_command(label="Group selection", accelerator="Ctrl+Shift+G", command=self.group_selection)
+        shape_menu.add_command(label="Ungroup", accelerator="Ctrl+Shift+U", command=self.ungroup_selection)
         shape_menu.add_separator()
         shape_menu.add_command(label="Delete selected", accelerator="Del", command=self.delete_selected)
         menu_bar.add_cascade(label="Shape", menu=shape_menu)
@@ -409,6 +439,10 @@ class ShapeCanvasApp:
         self.shape_popup.add_cascade(label="Depth", menu=depth_menu)
         self.depth_menu = depth_menu
 
+        self.shape_popup.add_separator()
+        self.shape_popup.add_command(label="Group selection", command=self.group_selection)
+        self.shape_popup.add_command(label="Ungroup", command=self.ungroup_selection)
+        self.shape_popup.add_separator()
         self.shape_popup.add_command(label="Properties...", command=self.open_properties)
 
         # Releasing the right button while no entry is highlighted takes the menu back down.
@@ -438,6 +472,8 @@ class ShapeCanvasApp:
         self.root.bind("<Escape>", lambda _event: self.select(None))
         self.root.bind("<Control-n>", lambda _event: self.clear_canvas())
         self.root.bind("<Control-z>", lambda _event: self.undo())
+        self.root.bind("<Control-G>", lambda _event: self.group_selection())  # Ctrl+Shift+G
+        self.root.bind("<Control-U>", lambda _event: self.ungroup_selection())
         self.root.bind("<Control-g>", lambda _event: self.toggle_grid(flip=True))
         self.root.bind("<Control-Up>", lambda _event: self.set_depth("up"))
         self.root.bind("<Control-Down>", lambda _event: self.set_depth("down"))
@@ -445,6 +481,7 @@ class ShapeCanvasApp:
         self.root.bind("<Control-Shift-Down>", lambda _event: self.set_depth("bottom"))
         self.root.bind("<Control-o>", lambda _event: self.load_state_dialog())
         self.root.bind("<Control-s>", lambda _event: self.save_state_dialog())
+        self.root.bind("<Control-e>", lambda _event: self.export_dialog())
         self.root.bind("<Control-q>", lambda _event: self.on_close())
 
     # ------------------------------------------------------------------ units
@@ -561,7 +598,10 @@ class ShapeCanvasApp:
             self._post(self.canvas_popup, event)
             return
 
-        self.select(item)  # the popup always acts on the shape it was opened over
+        if item not in self.selection:  # keep a multiple selection the user has built up
+            self.select(item)
+        elif self.selected != item:
+            self.select_items(self.selection, item)
         self._post(self.shape_popup, event)
 
     def _post(self, menu: tk.Menu, event: tk.Event) -> None:
@@ -586,15 +626,19 @@ class ShapeCanvasApp:
     # ------------------------------------------------------------- fill color
 
     def set_fill(self, color: str) -> None:
-        item = self.selected
-        record = self.shapes.get(item) if item is not None else None
-        if item is None or record is None:
+        targets = [item for item in self.selection if item in self.shapes]
+        if not targets:
             self.set_status("Right-click a shape to change its fill.")
             return
-        self.canvas.itemconfigure(item, fill=color)
-        record.fill = color
-        self.autosave(f"recolor of {record.kind}")
-        self.set_status(f"{record.kind.capitalize()} filled with {color}.")
+
+        for item in targets:
+            self.canvas.itemconfigure(item, fill=color)
+            self.shapes[item].fill = color
+            self.update_label(item)  # the name may need a lighter or darker ink
+
+        self.autosave("recolor")
+        subject = self._kind(targets[0]) if len(targets) == 1 else f"{len(targets)} shapes"
+        self.set_status(f"{subject.capitalize()} filled with {color}.")
 
     def choose_custom_fill(self) -> None:
         record = self.shapes.get(self.selected) if self.selected is not None else None
@@ -620,7 +664,12 @@ class ShapeCanvasApp:
         if record is None:
             self.pane_subject.configure(text="No shape selected")
         else:
-            self.pane_subject.configure(text=f"{record.kind.capitalize()} · depth {record.depth} · {record.uuid}")
+            summary = f"{record.kind.capitalize()} · depth {record.depth}"
+            if record.group:
+                summary += f" · group {record.group[:8]}"
+            if len(self.selection) > 1:
+                summary += f" · {len(self.selection)} selected, editing this one"
+            self.pane_subject.configure(text=f"{summary}\n{record.uuid}")
             self.pane_name.insert(0, record.name)
             self.pane_description.insert("1.0", record.description)
 
@@ -630,7 +679,10 @@ class ShapeCanvasApp:
 
     def commit_pane(self) -> None:
         """Write whatever is in the pane back to the shape it belongs to."""
-        record = self.shapes.get(self.pane_item) if self.pane_item is not None else None
+        item = self.pane_item
+        if item is None:
+            return
+        record = self.shapes.get(item)
         if record is None:
             return
 
@@ -640,15 +692,17 @@ class ShapeCanvasApp:
             return  # nothing typed, so nothing to save
 
         record.name, record.description = name, description
+        self.update_label(item)
         self.autosave(f"edit of {record.kind} properties")
         self.set_status(f"Saved properties for {name or record.uuid[:8]}.")
 
     def open_properties(self) -> None:
         """Edit the name and description of the shape the popup was opened on."""
-        record = self.shapes.get(self.selected) if self.selected is not None else None
-        if record is None:
+        item = self.selected
+        if item is None or item not in self.shapes:
             self.set_status("Right-click a shape to edit its properties.")
             return
+        record = self.shapes[item]
 
         dialog = PropertiesDialog(self.root, record)
         dialog.grab_set()  # modal: the canvas is off limits until it closes
@@ -659,7 +713,8 @@ class ShapeCanvasApp:
             return
 
         record.name, record.description = dialog.result
-        self.show_in_pane(self.selected)
+        self.update_label(item)
+        self.show_in_pane(item)
         self.autosave(f"edit of {record.kind} properties")
         label = record.name or record.uuid[:8]
         self.set_status(f"Saved properties for {label}.")
@@ -694,27 +749,135 @@ class ShapeCanvasApp:
         create = self.canvas.create_rectangle if record.kind == "rectangle" else self.canvas.create_oval
         item = create(*box, fill=record.fill, outline=SHAPE_OUTLINE, width=1, tags=(TAG_SHAPE,))
         self.shapes[item] = record
+        self.update_label(item)
         return item
+
+    # ----------------------------------------------------------- shape labels
+
+    def update_label(self, item: int) -> None:
+        """Draw the shape's name on it, or take the text away when the name is empty."""
+        existing = self.labels.pop(item, None)
+        if existing is not None:
+            self.canvas.delete(existing)
+
+        record = self.shapes.get(item)
+        if record is None or not record.name:
+            return
+
+        x1, y1, x2, y2 = self.canvas.coords(item)
+        label = self.canvas.create_text(
+            (x1 + x2) / 2,
+            (y1 + y2) / 2,
+            text=record.name,
+            fill=self._text_color(record.fill),
+            width=max(x2 - x1 - 6, 10),  # wrap inside the shape rather than spilling out
+            justify=tk.CENTER,
+            tags=(TAG_LABEL,),
+        )
+        self.labels[item] = label
+        self.canvas.tag_raise(label, item)
+
+    def _place_label(self, item: int) -> None:
+        """Keep the label centred while its shape is dragged or resized."""
+        label = self.labels.get(item)
+        if label is None:
+            return
+        x1, y1, x2, y2 = self.canvas.coords(item)
+        self.canvas.coords(label, (x1 + x2) / 2, (y1 + y2) / 2)
+        self.canvas.itemconfigure(label, width=max(x2 - x1 - 6, 10))
+
+    def _text_color(self, fill: str) -> str:
+        """Black on light fills, white on dark ones, so the name stays readable."""
+        try:
+            red, green, blue = self.canvas.winfo_rgb(fill)
+        except tk.TclError:
+            return "#101010"
+        luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 65535
+        return "#101010" if luminance > 0.55 else "#ffffff"
 
     # -------------------------------------------------------------- selection
 
-    def select(self, item: int | None) -> None:
-        if item != self.pane_item:
-            self.commit_pane()  # don't lose text typed for the shape we are leaving
-        self.selected = item
-        self._redraw_handles()
-        self.show_in_pane(item)
-        if item is None:
-            self.set_status("Nothing selected.")
-        else:
-            self._report_size(item)
+    def select(self, item: int | None, add: bool = False) -> None:
+        """Select one shape, or with `add` toggle it into the current selection.
 
-    def _redraw_handles(self) -> None:
-        self.canvas.delete(TAG_HANDLE)
-        if self.selected is None:
+        Selecting any member of a group selects the whole group, which is what makes
+        a group move and resize as one piece.
+        """
+        if item is None:
+            self.select_items([], None)
             return
 
-        x1, y1, x2, y2 = self.canvas.coords(self.selected)
+        family = self.group_members(item)
+        if not add:
+            self.select_items(family, item)
+            return
+
+        if item in self.selection:  # shift-clicking a selected shape takes it back out
+            remaining = [other for other in self.selection if other not in family]
+            self.select_items(remaining, remaining[-1] if remaining else None)
+        else:
+            self.select_items(self.selection + family, item)
+
+    def select_items(self, items: list[int], primary: int | None) -> None:
+        """Replace the selection. `primary` is the one the properties pane edits."""
+        if primary != self.pane_item:
+            self.commit_pane()  # don't lose text typed for the shape we are leaving
+
+        seen: dict[int, None] = {}  # an ordered set: keep click order, drop duplicates
+        for item in items:
+            if item in self.shapes:
+                seen[item] = None
+        self.selection = list(seen)
+
+        if primary not in self.selection:
+            primary = self.selection[-1] if self.selection else None
+        self.selected = primary
+
+        self._redraw_selection()
+        self.show_in_pane(primary)
+        if primary is None:
+            self.set_status("Nothing selected.")
+        elif len(self.selection) > 1:
+            group = self.shapes[primary].group
+            what = "group" if group else "shapes"
+            self.set_status(f"{len(self.selection)} {what} selected. Drag to move them together.")
+        else:
+            self._report_size(primary)
+
+    def selection_box(self) -> tuple[float, float, float, float] | None:
+        """The bounding box around everything selected, which is what the handles frame."""
+        boxes = [self.canvas.coords(item) for item in self.selection if item in self.shapes]
+        if not boxes:
+            return None
+        return (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+
+    def _redraw_selection(self) -> None:
+        self.canvas.delete(TAG_HANDLE)
+        self.canvas.delete(TAG_MARK)
+        box = self.selection_box()
+        if box is None:
+            return
+
+        if len(self.selection) > 1:
+            # Show which shapes are in the selection, since the handles only frame the whole.
+            for item in self.selection:
+                mx1, my1, mx2, my2 = self.canvas.coords(item)
+                self.canvas.create_rectangle(
+                    mx1 - 2,
+                    my1 - 2,
+                    mx2 + 2,
+                    my2 + 2,
+                    outline=HANDLE_OUTLINE,
+                    dash=(3, 2),
+                    tags=(TAG_MARK,),
+                )
+
+        x1, y1, x2, y2 = box
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
         positions = {
             "nw": (x1, y1),
@@ -761,6 +924,50 @@ class ShapeCanvasApp:
                 return item
         return None
 
+    # ----------------------------------------------------------------- groups
+
+    def group_members(self, item: int) -> list[int]:
+        """Every shape sharing this shape's group, or just the shape when it is on its own."""
+        record = self.shapes.get(item)
+        if record is None:
+            return []
+        if not record.group:
+            return [item]
+        return [other for other in self._by_depth() if self.shapes[other].group == record.group]
+
+    def group_index(self) -> dict[str, list[int]]:
+        """Group uuid -> its member items, in depth order."""
+        groups: dict[str, list[int]] = {}
+        for item in self._by_depth():
+            group = self.shapes[item].group
+            if group:
+                groups.setdefault(group, []).append(item)
+        return groups
+
+    def group_selection(self) -> None:
+        if len(self.selection) < 2:
+            self.set_status("Shift-click a second shape before grouping.")
+            return
+
+        identifier = str(uuid.uuid4())
+        for item in self.selection:
+            self.shapes[item].group = identifier
+        self._redraw_selection()
+        self.autosave("grouping")
+        self.set_status(f"Grouped {len(self.selection)} shapes as {identifier[:8]}.")
+
+    def ungroup_selection(self) -> None:
+        grouped = [item for item in self.selection if self.shapes[item].group]
+        if not grouped:
+            self.set_status("Nothing in the selection belongs to a group.")
+            return
+
+        for item in grouped:
+            self.shapes[item].group = ""
+        self._redraw_selection()
+        self.autosave("ungrouping")
+        self.set_status(f"Ungrouped {len(grouped)} shapes.")
+
     # ------------------------------------------------------------------ depth
 
     def _by_depth(self) -> list[int]:
@@ -776,6 +983,9 @@ class ShapeCanvasApp:
         """Make the canvas stacking order match the recorded depths."""
         for item in self._by_depth():
             self.canvas.tag_raise(item)
+            label = self.labels.get(item)
+            if label is not None:
+                self.canvas.tag_raise(label, item)  # a name stays on its own shape
         self.canvas.tag_raise(TAG_HANDLE)  # handles stay reachable above every shape
         self.canvas.tag_lower(TAG_GRID)  # and the grid stays underneath everything
 
@@ -808,57 +1018,94 @@ class ShapeCanvasApp:
 
     def on_press(self, event: tk.Event) -> None:
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        shift = bool(self._modifiers(event) & 0x0001)
         handle = self._handle_under(self._current_item())
 
-        if handle is not None and self.selected is not None:
-            self.drag_mode = "resize"
+        if handle is not None and self.selection:
+            self._begin_drag("resize", x, y)
             self.drag_handle = handle
-            self.drag_start = (x, y)
-            bx1, by1, bx2, by2 = self.canvas.coords(self.selected)
-            self.drag_bbox = (bx1, by1, bx2, by2)
             return
 
         item = self._topmost_shape_at(x, y)
         if item is None:
             self.drag_mode = None
-            self.select(None)
+            if not shift:  # shift-clicking empty space keeps what is already selected
+                self.select(None)
             return
 
-        self.select(item)
-        self.drag_mode = "move"
+        self.select(item, add=shift)
+        self._begin_drag("move", x, y)
         self.drag_handle = None
+
+    def _begin_drag(self, mode: str, x: float, y: float) -> None:
+        """Remember where everything started, so snapping measures from a fixed origin."""
+        self.drag_mode = mode
         self.drag_start = (x, y)
-        mx1, my1, mx2, my2 = self.canvas.coords(item)
-        self.drag_bbox = (mx1, my1, mx2, my2)  # move is measured from here, so snapping cannot drift
+        self.drag_items = {}
+        for item in self.selection:
+            ix1, iy1, ix2, iy2 = self.canvas.coords(item)
+            self.drag_items[item] = (ix1, iy1, ix2, iy2)
+        box = self.selection_box()
+        self.drag_bbox = box if box is not None else (0.0, 0.0, 0.0, 0.0)
 
     def on_drag(self, event: tk.Event) -> None:
-        if self.drag_mode is None or self.selected is None:
+        if self.drag_mode is None or not self.selection:
             return
 
         x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         if self.drag_mode == "move":
-            x1, y1, x2, y2 = self.drag_bbox
-            left = self.snap(x1 + (x - self.drag_start[0]))
-            top = self.snap(y1 + (y - self.drag_start[1]))
-            self.canvas.coords(self.selected, left, top, left + (x2 - x1), top + (y2 - y1))
-            self._redraw_handles()
-            self._report_position(self.selected)
+            self._drag_move(x, y)
         else:
-            state = event.state if isinstance(event.state, int) else 0
-            keep_ratio = bool(state & 0x0001)  # Shift held
-            self.canvas.coords(self.selected, *self._resized_box(x, y, keep_ratio))
-            self._redraw_handles()
-            self._report_size(self.selected)
+            keep_ratio = bool(self._modifiers(event) & 0x0001)  # Shift held
+            self._drag_resize(self._resized_box(x, y, keep_ratio))
+
+        self._redraw_selection()
+        if self.selected is not None:
+            if self.drag_mode == "move":
+                self._report_position(self.selected)
+            else:
+                self._report_size(self.selected)
+
+    def _drag_move(self, x: float, y: float) -> None:
+        """Shift the whole selection, snapping the group's own top-left to the grid."""
+        left = self.snap(self.drag_bbox[0] + (x - self.drag_start[0]))
+        top = self.snap(self.drag_bbox[1] + (y - self.drag_start[1]))
+        dx, dy = left - self.drag_bbox[0], top - self.drag_bbox[1]
+        for item, (ix1, iy1, ix2, iy2) in self.drag_items.items():
+            self.canvas.coords(item, ix1 + dx, iy1 + dy, ix2 + dx, iy2 + dy)
+            self._place_label(item)
+
+    def _drag_resize(self, box: tuple[float, float, float, float]) -> None:
+        """Scale every selected shape into the new frame, keeping their relative places."""
+        ox1, oy1, ox2, oy2 = self.drag_bbox
+        nx1, ny1, nx2, ny2 = box
+        scale_x = (nx2 - nx1) / (ox2 - ox1) if ox2 > ox1 else 1.0
+        scale_y = (ny2 - ny1) / (oy2 - oy1) if oy2 > oy1 else 1.0
+        for item, (ix1, iy1, ix2, iy2) in self.drag_items.items():
+            self.canvas.coords(
+                item,
+                nx1 + (ix1 - ox1) * scale_x,
+                ny1 + (iy1 - oy1) * scale_y,
+                nx1 + (ix2 - ox1) * scale_x,
+                ny1 + (iy2 - oy1) * scale_y,
+            )
+            self._place_label(item)
 
     def on_release(self, _event: tk.Event) -> None:
-        if self.drag_mode is not None and self.selected is not None:
-            self._report_size(self.selected)
+        if self.drag_mode is not None and self.selection:
+            if self.selected is not None:
+                self._report_size(self.selected)
             self.autosave("move" if self.drag_mode == "move" else "resize")  # written once the drag settles
         self.drag_mode = None
         self.drag_handle = None
+        self.drag_items = {}
+
+    @staticmethod
+    def _modifiers(event: tk.Event) -> int:
+        return event.state if isinstance(event.state, int) else 0
 
     def _resized_box(self, x: float, y: float, keep_ratio: bool) -> tuple[float, float, float, float]:
-        """Return the new bounding box for the current resize drag, snapped to the grid."""
+        """Return the new frame for the current resize drag, snapped to the grid."""
         x1, y1, x2, y2 = self.drag_bbox
         handle = self.drag_handle or ""
         x, y = self.snap(x), self.snap(y)
@@ -898,23 +1145,60 @@ class ShapeCanvasApp:
 
     # ------------------------------------------------------------- housekeeping
 
+    def confirm_delete(self, question: str) -> bool:
+        """Ask before destroying anything, unless the user has turned confirmation off."""
+        if not self.confirm_deletes.get():
+            return True
+        return bool(messagebox.askyesno("Confirm delete", question, parent=self.root, default=messagebox.NO))
+
+    def on_confirm_setting_changed(self) -> None:
+        self.autosave("delete confirmation setting")
+        if self.confirm_deletes.get():
+            self.set_status("Deletes will be confirmed.")
+        else:
+            self.set_status("Deletes happen straight away now. Undo still works.")
+
     def delete_selected(self) -> None:
-        if self.selected is None:
+        targets = [item for item in self.selection if item in self.shapes]
+        if not targets:
             self.set_status("Select a shape first, then delete it.")
             return
-        record = self.shapes.pop(self.selected, None)
-        self.pane_item = None  # its record is gone; nothing to commit back to
-        self.canvas.delete(self.selected)
-        self.canvas.delete(TAG_HANDLE)
+
+        if len(targets) == 1:
+            record = self.shapes[targets[0]]
+            described = f'the {record.kind} "{record.name}"' if record.name else f"this {record.kind}"
+        else:
+            described = f"these {len(targets)} shapes"
+        if not self.confirm_delete(f"Delete {described}?"):
+            self.set_status("Delete cancelled.")
+            return
+
+        for item in targets:
+            self.shapes.pop(item, None)
+            label = self.labels.pop(item, None)
+            if label is not None:
+                self.canvas.delete(label)
+            self.canvas.delete(item)
+
+        self.pane_item = None  # their records are gone; nothing to commit back to
+        self.selection = []
         self.selected = None
+        self.canvas.delete(TAG_HANDLE)
+        self.canvas.delete(TAG_MARK)
         self.show_in_pane(None)
-        self._renumber(self._by_depth())  # close the gap the deleted layer left
-        self.autosave(f"deletion of the {record.kind if record else 'shape'}")
-        self.set_status(f"Deleted {record.kind if record else 'shape'}.")
+        self._renumber(self._by_depth())  # close the gaps the deleted layers left
+        self.autosave(f"deletion of {described}")
+        self.set_status(f"Deleted {described}.")
 
     def clear_canvas(self) -> None:
+        count = len(self.shapes)
+        if count and not self.confirm_delete(f"Delete all {count} shape(s) from the canvas?"):
+            self.set_status("Clear cancelled.")
+            return
         self.canvas.delete("all")
         self.shapes.clear()
+        self.labels.clear()
+        self.selection = []
         self.selected = None
         self.pane_item = None
         self.show_in_pane(None)
@@ -925,8 +1209,8 @@ class ShapeCanvasApp:
     def show_help(self) -> None:
         self.set_status(
             "Right-click empty canvas to add a shape, right-click a shape to recolor it. "
-            "Drag to move, drag a handle to resize; everything snaps to the 1 cm grid (Ctrl+G hides it). "
-            f"The Json tab mirrors {STATE_FILE}."
+            "Drag to move, drag a handle to resize; everything snaps to the grid (Ctrl+G hides it). "
+            "Del removes the selection after a confirmation, Ctrl+Z undoes the last change."
         )
 
     def on_hover(self, event: tk.Event) -> None:
@@ -943,6 +1227,149 @@ class ShapeCanvasApp:
             self.canvas.configure(cursor=cursor)
         except tk.TclError:
             self.canvas.configure(cursor="")
+
+    # ----------------------------------------------------------------- export
+
+    def content_box(self) -> tuple[float, float, float, float] | None:
+        """The bounding box of every shape, widened by a one-centimetre margin."""
+        boxes = [self.canvas.coords(item) for item in self.shapes]
+        if not boxes:
+            return None
+        margin = self.cm(EXPORT_MARGIN_CM)
+        return (
+            min(box[0] for box in boxes) - margin,
+            min(box[1] for box in boxes) - margin,
+            max(box[2] for box in boxes) + margin,
+            max(box[3] for box in boxes) + margin,
+        )
+
+    def export_dialog(self) -> None:
+        """Ask where to write the picture, then write it in the format the name implies."""
+        if not self.shapes:
+            self.set_status("Draw something before exporting.")
+            return
+
+        chosen = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export as picture",
+            initialdir=str(Path.home()),
+            initialfile=f"{APP_NAME}.png",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg"), ("SVG drawing", "*.svg")],
+        )
+        if chosen:
+            self.export_to(Path(chosen))
+
+    def export_to(self, path: Path) -> bool:
+        suffix = path.suffix.lower()
+        if suffix not in EXPORT_FORMATS:
+            self._warn(
+                "Unsupported picture format",
+                f"{path}\n\nExport needs one of: {', '.join(sorted(EXPORT_FORMATS))}.",
+            )
+            return False
+
+        box = self.content_box()
+        if box is None:
+            self.set_status("Draw something before exporting.")
+            return False
+
+        try:
+            if suffix == ".svg":
+                path.write_text(self._as_svg(box), encoding="utf-8")
+            else:
+                self._write_raster(path, box, suffix)
+        except OSError as error:
+            self._warn("Could not write the picture", f"{path}\n\n{error.strerror or error}")
+            return False
+        except ImportError:
+            self._warn(
+                "Pillow is not installed",
+                "PNG and JPEG export needs the Pillow package:\n\n    pip install pillow\n\n"
+                "SVG export works without it.",
+            )
+            return False
+
+        width, height = box[2] - box[0], box[3] - box[1]
+        self.set_status(f"Exported {len(self.shapes)} shape(s) to {path} ({int(width)}x{int(height)} px).")
+        return True
+
+    def _export_items(
+        self, box: tuple[float, float, float, float]
+    ) -> list[tuple[ShapeRecord, tuple[float, float, float, float]]]:
+        """Shapes in drawing order, with coordinates moved into the picture's own frame."""
+        drawn = []
+        for item in self._by_depth():
+            x1, y1, x2, y2 = self.canvas.coords(item)
+            drawn.append((self.shapes[item], (x1 - box[0], y1 - box[1], x2 - box[0], y2 - box[1])))
+        return drawn
+
+    def _as_svg(self, box: tuple[float, float, float, float]) -> str:
+        width, height = box[2] - box[0], box[3] - box[1]
+        parts = [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" '
+            f'viewBox="0 0 {width:.0f} {height:.0f}">',
+            f'<rect width="100%" height="100%" fill="{CANVAS_BG}"/>',
+        ]
+        for record, (x1, y1, x2, y2) in self._export_items(box):
+            shape_width, shape_height = x2 - x1, y2 - y1
+            common = f'fill="{record.fill}" stroke="{SHAPE_OUTLINE}" stroke-width="1"'
+            if record.kind == "rectangle":
+                parts.append(
+                    f'<rect x="{x1:.2f}" y="{y1:.2f}" width="{shape_width:.2f}" height="{shape_height:.2f}" {common}/>'
+                )
+            else:
+                parts.append(
+                    f'<ellipse cx="{x1 + shape_width / 2:.2f}" cy="{y1 + shape_height / 2:.2f}" '
+                    f'rx="{shape_width / 2:.2f}" ry="{shape_height / 2:.2f}" {common}/>'
+                )
+            if record.name:
+                parts.append(
+                    f'<text x="{x1 + shape_width / 2:.2f}" y="{y1 + shape_height / 2:.2f}" '
+                    f'text-anchor="middle" dominant-baseline="central" '
+                    f'font-family="sans-serif" font-size="{EXPORT_FONT_SIZE}" '
+                    f'fill="{self._text_color(record.fill)}">{escape(record.name)}</text>'
+                )
+        parts.append("</svg>")
+        return "\n".join(parts) + "\n"
+
+    def _write_raster(self, path: Path, box: tuple[float, float, float, float], suffix: str) -> None:
+        """Draw the shapes into a bitmap. Raises ImportError when Pillow is absent."""
+        from PIL import Image, ImageDraw, ImageFont  # imported here so SVG export works without it
+
+        width, height = max(int(box[2] - box[0]), 1), max(int(box[3] - box[1]), 1)
+        image = Image.new("RGB", (width, height), CANVAS_BG)
+        draw = ImageDraw.Draw(image)
+
+        font: Any = None
+        for candidate in EXPORT_FONTS:
+            try:
+                font = ImageFont.truetype(candidate, EXPORT_FONT_SIZE)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        for record, (x1, y1, x2, y2) in self._export_items(box):
+            corners = (x1, y1, max(x2, x1 + 1), max(y2, y1 + 1))
+            if record.kind == "rectangle":
+                draw.rectangle(corners, fill=record.fill, outline=SHAPE_OUTLINE, width=1)
+            else:
+                draw.ellipse(corners, fill=record.fill, outline=SHAPE_OUTLINE, width=1)
+            if record.name:
+                draw.text(
+                    ((corners[0] + corners[2]) / 2, (corners[1] + corners[3]) / 2),
+                    record.name,
+                    fill=self._text_color(record.fill),
+                    font=font,
+                    anchor="mm",
+                )
+
+        if suffix in (".jpg", ".jpeg"):
+            image.save(path, "JPEG", quality=92)
+        else:
+            image.save(path, "PNG")
 
     # ------------------------------------------------------------ state files
 
@@ -962,6 +1389,11 @@ class ShapeCanvasApp:
                 "grid_color": self.grid_color.get(),
                 "grid_line": self.grid_line.get(),
             },
+            "settings": {"confirm_deletes": self.confirm_deletes.get()},
+            "groups": [
+                {"uuid": identifier, "members": [self.shapes[item].uuid for item in members]}
+                for identifier, members in self.group_index().items()
+            ],
             "shapes": shapes,
         }
 
@@ -1128,6 +1560,8 @@ class ShapeCanvasApp:
         try:
             self.canvas.delete("all")
             self.shapes.clear()
+            self.labels.clear()
+            self.selection = []
             self.selected = None
             self.pane_item = None
             self.show_in_pane(None)
@@ -1144,6 +1578,10 @@ class ShapeCanvasApp:
                 pitch = canvas_settings.get("grid_cm")
                 if isinstance(pitch, (int, float)) and not isinstance(pitch, bool):
                     self.grid_cm.set(min(max(float(pitch), GRID_CM_MIN), GRID_CM_MAX))
+
+            settings = raw.get("settings")
+            if isinstance(settings, dict) and "confirm_deletes" in settings:
+                self.confirm_deletes.set(bool(settings["confirm_deletes"]))
             self.draw_grid()
             for position, entry in enumerate(raw.get("shapes", [])):
                 box = self._box_from(entry)
@@ -1161,14 +1599,33 @@ class ShapeCanvasApp:
                         name=str(entry.get("name") or ""),
                         description=str(entry.get("description") or ""),
                         depth=depth if isinstance(depth, int) else position,  # file order is the fallback
+                        group=str(entry.get("group") or ""),
                     ),
                     box,
                 )
+            self._apply_groups(raw.get("groups"))
             self._renumber(self._by_depth())
             self.restack()
         finally:
             self.suspend_autosave = False
         self.autosave("loading a state file")
+
+    def _apply_groups(self, groups: object) -> None:
+        """Honour the file's `groups` list, which is the authoritative membership record."""
+        if not isinstance(groups, list):
+            return
+        by_uuid = {record.uuid: record for record in self.shapes.values()}
+        for entry in groups:
+            if not isinstance(entry, dict):
+                continue
+            identifier = str(entry.get("uuid") or "")
+            members = entry.get("members")
+            if not identifier or not isinstance(members, list):
+                continue
+            for member in members:
+                record = by_uuid.get(str(member))
+                if record is not None:
+                    record.group = identifier
 
     @staticmethod
     def _box_from(entry: object) -> tuple[float, float, float, float] | None:
